@@ -17,3 +17,5 @@ outputs/
 Thumbs.db
 .vscode/
 .idea/
+# allow thesis precomputed CSVs to be committed
+!thesis_pipeline/**/*.csv
