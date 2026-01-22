@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,19 +7,17 @@ import sys
 import uuid
 import pathlib
 import subprocess
-from typing import Optional
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.0"
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs" / "server_results"
 SCRIPT_PATH = BASE_DIR / "realworld_demo_rppg_single.py"
-THESIS_ROOT = BASE_DIR / "thesis_pipeline"
 
-
-# ✅ Force correct thesis_pipeline location inside rppg_server_pack
+# ✅ Add this here:
 THESIS_ROOT = BASE_DIR / "thesis_pipeline"
+THESIS_CSV = THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,26 +28,23 @@ app = FastAPI(title="rPPG Server", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # later: ["https://rppgweb.onrender.com"]
-    allow_credentials=False,  # safer with allow_origins=["*"]
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 @app.get("/", include_in_schema=False)
 def root():
-    # nice home page instead of Not Found
     return RedirectResponse(url="/docs")
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
+    # Helpful for debugging Render path issues
     return {
         "ok": True,
         "version": APP_VERSION,
-        "base_dir": str(BASE_DIR),
-        "script_path": str(SCRIPT_PATH),
         "thesis_root": str(THESIS_ROOT),
-        "thesis_root_exists": THESIS_ROOT.exists(),
-        "thesis_csv_exists": (THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv").exists(),
+        "thesis_csv_exists": THESIS_CSV.exists(),
     }
 
 def _parse_last_json_line(stdout_text: str) -> dict:
@@ -62,46 +57,27 @@ def _parse_last_json_line(stdout_text: str) -> dict:
                 continue
     return {"ok": 0, "error": "No JSON line found in stdout", "stdout_tail": lines[-10:]}
 
-def _validate_choice(name: str, value: str, allowed: set[str]) -> str:
-    v = (value or "").strip().lower()
-    if v not in allowed:
-        raise HTTPException(status_code=400, detail=f"Invalid {name}='{value}'. Allowed: {sorted(allowed)}")
-    return v
-
 @app.post("/upload_video")
 async def upload_video(
     file: UploadFile = File(...),
     subject_id: str = Form(...),
-    condition: str = Form(...),  # rest/exercise/breath
-    modality: str = Form(...),   # face/palm
-    method: str = Form("thesis_precomputed"),  # thesis_precomputed/fft
+    condition: str = Form(...),
+    modality: str = Form(...),
+    method: str = Form("thesis_precomputed"),
     min_valid_pct: float = Form(50.0),
     save: int = Form(0),
-    timeout_sec: int = Form(120),  # Render-safe default timeout
 ):
-    # Basic validations
-    subject_id = (subject_id or "").strip()
-    if not subject_id:
-        raise HTTPException(status_code=400, detail="subject_id is required")
-
-    condition = _validate_choice("condition", condition, {"rest", "exercise", "breath"})
-    modality = _validate_choice("modality", modality, {"face", "palm"})
-    method = _validate_choice("method", method, {"thesis_precomputed", "fft"})
-
-    # Ensure thesis files exist if precomputed requested
-    if method == "thesis_precomputed":
-        csv_path = THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv"
-        if not csv_path.exists():
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "ok": 0,
-                    "error": "Missing precomputed thesis CSV on server",
-                    "expected_csv": str(csv_path),
-                    "thesis_root": str(THESIS_ROOT),
-                    "base_dir": str(BASE_DIR),
-                },
-            )
+    # Quick fail-fast if thesis_precomputed is requested but CSV isn't present
+    if method == "thesis_precomputed" and not THESIS_CSV.exists():
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": 0,
+                "error": "thesis_summary_missing_on_server",
+                "looked_for": str(THESIS_CSV),
+                "hint": "Confirm thesis_pipeline is committed and deployed, and that THESIS_ROOT points to the correct folder.",
+            },
+        )
 
     # Save upload
     ext = pathlib.Path(file.filename or "").suffix.lower()
@@ -119,35 +95,23 @@ async def upload_video(
                     break
                 f.write(chunk)
 
-        # ✅ Run pipeline script, FORCE thesis_root path (no ../ ever)
+        # Run pipeline script
         cmd = [
-            sys.executable,
-            str(SCRIPT_PATH),
+            sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
             "--subject", str(subject_id),
             "--condition", str(condition),
             "--modality", str(modality),
             "--outdir", str(OUTPUT_DIR),
             "--method", str(method),
-            "--min_valid_pct", str(float(min_valid_pct)),
+            "--min_valid_pct", str(min_valid_pct),
             "--save", str(int(save)),
+
+            # ✅ Pass thesis_root explicitly (Render-safe)
             "--thesis_root", str(THESIS_ROOT),
         ]
 
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_sec))
-        except subprocess.TimeoutExpired as te:
-            return JSONResponse(
-                status_code=504,
-                content={
-                    "ok": 0,
-                    "error": "Pipeline timeout",
-                    "timeout_sec": int(timeout_sec),
-                    "cmd": cmd,
-                    "stdout": (te.stdout or "")[-4000:],
-                    "stderr": (te.stderr or "")[-4000:],
-                },
-            )
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
         if proc.returncode != 0:
             return JSONResponse(
@@ -173,15 +137,6 @@ async def upload_video(
         if trusted_val == 0.0:
             data["hr_bpm"] = None
 
-        # add server context (helps debugging)
-        data["_server"] = {
-            "version": APP_VERSION,
-            "base_dir": str(BASE_DIR),
-            "script_path": str(SCRIPT_PATH),
-            "thesis_root": str(THESIS_ROOT),
-            "upload_saved_as": str(dst_path.name),
-        }
-
         # cleanup upload if save==0
         if int(save) == 0:
             try:
@@ -191,16 +146,5 @@ async def upload_video(
 
         return JSONResponse(content=data)
 
-    except HTTPException:
-        raise
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": 0,
-                "error": str(e),
-                "base_dir": str(BASE_DIR),
-                "script_path": str(SCRIPT_PATH),
-                "thesis_root": str(THESIS_ROOT),
-            },
-        )
+        return JSONResponse(status_code=500, content={"ok": 0, "error": str(e)})
