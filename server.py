@@ -1,7 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+import csv
 import json
 import sys
 import uuid
@@ -15,19 +17,26 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs" / "server_results"
 SCRIPT_PATH = BASE_DIR / "realworld_demo_rppg_single.py"
 
-# ✅ Add this here:
+# ✅ thesis precomputed CSV
 THESIS_ROOT = BASE_DIR / "thesis_pipeline"
 THESIS_CSV = THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv"
 
+# ✅ NEW: where we save downloadable CSVs
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="rPPG Server", version=APP_VERSION)
+
+# ✅ Serve saved files at /files/<filename>
+app.mount("/files", StaticFiles(directory=str(DOWNLOADS_DIR)), name="files")
 
 # CORS (allow your web app to call this API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later: ["https://rppgweb.onrender.com"]
+    allow_origins=["*"],  # later: ["https://rppg-web.onrender.com"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,12 +48,12 @@ def root():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    # Helpful for debugging Render path issues
     return {
         "ok": True,
         "version": APP_VERSION,
         "thesis_root": str(THESIS_ROOT),
         "thesis_csv_exists": THESIS_CSV.exists(),
+        "downloads_dir": str(DOWNLOADS_DIR),
     }
 
 def _parse_last_json_line(stdout_text: str) -> dict:
@@ -57,8 +66,22 @@ def _parse_last_json_line(stdout_text: str) -> dict:
                 continue
     return {"ok": 0, "error": "No JSON line found in stdout", "stdout_tail": lines[-10:]}
 
+def _flatten_dict(d, prefix=""):
+    """Flatten nested dicts into 1-level dict suitable for CSV."""
+    out = {}
+    if not isinstance(d, dict):
+        return out
+    for k, v in d.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            out.update(_flatten_dict(v, key))
+        else:
+            out[key] = v
+    return out
+
 @app.post("/upload_video")
 async def upload_video(
+    request: Request,
     file: UploadFile = File(...),
     subject_id: str = Form(...),
     condition: str = Form(...),
@@ -67,7 +90,7 @@ async def upload_video(
     min_valid_pct: float = Form(50.0),
     save: int = Form(0),
 ):
-    # Quick fail-fast if thesis_precomputed is requested but CSV isn't present
+    # Fail-fast if thesis_precomputed is requested but CSV isn't present
     if method == "thesis_precomputed" and not THESIS_CSV.exists():
         return JSONResponse(
             status_code=500,
@@ -106,8 +129,6 @@ async def upload_video(
             "--method", str(method),
             "--min_valid_pct", str(min_valid_pct),
             "--save", str(int(save)),
-
-            # ✅ Pass thesis_root explicitly (Render-safe)
             "--thesis_root", str(THESIS_ROOT),
         ]
 
@@ -136,6 +157,24 @@ async def upload_video(
 
         if trusted_val == 0.0:
             data["hr_bpm"] = None
+
+        # ✅ NEW: if save==1, write a CSV + return download URL
+        if int(save) == 1 and isinstance(data, dict):
+            flat = _flatten_dict(data)
+
+            csv_name = f"summary_{subject_id}_{condition}_{modality}_{uuid.uuid4().hex[:8]}.csv"
+            csv_path = DOWNLOADS_DIR / csv_name
+
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(flat.keys()))
+                writer.writeheader()
+                writer.writerow(flat)
+
+            base = str(request.base_url).rstrip("/")
+            data["saved"] = {
+                "summary_metrics_csv": csv_name,
+                "download_url": f"{base}/files/{csv_name}",
+            }
 
         # cleanup upload if save==0
         if int(save) == 0:
