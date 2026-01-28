@@ -1,14 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, Form, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
+from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 import csv
 import json
+import re
 import sys
 import uuid
 import pathlib
 import subprocess
+from datetime import datetime
 
 APP_VERSION = "0.2.0"
 
@@ -27,13 +28,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="rPPG Server", version=APP_VERSION)
 
-# Serve saved CSVs
-app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # later: lock to your rppg-web domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,109 +46,128 @@ def healthz():
         "ok": True,
         "version": APP_VERSION,
         "thesis_root": str(THESIS_ROOT),
-        "thesis_csv": str(THESIS_CSV),
         "thesis_csv_exists": THESIS_CSV.exists(),
-        "script_path": str(SCRIPT_PATH),
-        "script_exists": SCRIPT_PATH.exists(),
     }
 
+def _norm_key(k: str) -> str:
+    k = (k or "").strip()
+    k = re.sub(r"[^0-9a-zA-Z]+", "_", k)
+    return k.strip("_").lower()
+
+def _normalize_dict(d: dict) -> dict:
+    out = {}
+    for k, v in (d or {}).items():
+        out[_norm_key(str(k))] = v
+    return out
+
 def _parse_last_json_line(stdout_text: str) -> dict:
-    lines = [ln.strip() for ln in stdout_text.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in (stdout_text or "").splitlines() if ln.strip()]
     for ln in reversed(lines):
         if ln.startswith("{") and ln.endswith("}"):
             try:
                 return json.loads(ln)
             except Exception:
                 continue
-    return {"ok": 0, "error": "No JSON line found in stdout", "stdout_tail": lines[-10:]}
+    return {"ok": 0, "error": "no_json_line_found", "stdout_tail": lines[-30:]}
 
-def _row_get_ci(row: dict, *keys: str):
-    """Case-insensitive dict key lookup."""
-    lower_map = {str(k).lower(): k for k in row.keys()}
-    for key in keys:
-        k = lower_map.get(key.lower())
-        if k is not None:
-            return row.get(k)
-    return None
-
-def _to_float_or_none(x):
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "" or s.lower() == "nan":
-            return None
-        return float(s)
-    except Exception:
+def _find_row_in_thesis_csv(stem: str) -> dict | None:
+    if not THESIS_CSV.exists():
         return None
 
-def lookup_thesis_precomputed(subject_id: str, condition: str, modality: str, min_valid_pct: float):
-    if not THESIS_CSV.exists():
-        return {
-            "ok": 0,
-            "error": "thesis_summary_missing_on_server",
-            "looked_for": str(THESIS_CSV),
-        }
+    stem = (stem or "").strip()
 
-    stem = f"{subject_id}_{condition}_{modality}"
-
-    with THESIS_CSV.open("r", newline="", encoding="utf-8") as f:
+    with THESIS_CSV.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        rows = list(reader)
+        if not reader.fieldnames:
+            return None
 
-    # Try match by 'stem' first, then by (subject, condition, modality)
-    match = None
-    for row in rows:
-        row_stem = _row_get_ci(row, "stem")
-        if row_stem and str(row_stem).strip() == stem:
-            match = row
-            break
+        fields_norm = {_norm_key(c): c for c in reader.fieldnames}
 
-    if match is None:
-        for row in rows:
-            r_sub = _row_get_ci(row, "subject", "subject_id")
-            r_cond = _row_get_ci(row, "condition")
-            r_mod = _row_get_ci(row, "modality")
-            if (str(r_sub).strip() == subject_id) and (str(r_cond).strip() == condition) and (str(r_mod).strip() == modality):
-                match = row
+        # Try to locate a "stem" column (or similar)
+        key_candidates = ["stem", "video_stem", "clip_stem", "name", "video", "id"]
+        key_col = None
+        for cand in key_candidates:
+            if cand in fields_norm:
+                key_col = fields_norm[cand]
                 break
 
-    if match is None:
-        return {
-            "ok": 0,
-            "error": "no_matching_row_in_thesis_csv",
-            "stem": stem,
-            "hint": "Check if your CSV has 'stem' or subject/condition/modality columns, and that values match exactly.",
-        }
+        # HR column candidates
+        hr_candidates = ["hr_bpm", "hr", "hrvalue", "hr_val", "hrbpm"]
+        hr_col = None
+        for cand in hr_candidates:
+            if cand in fields_norm:
+                hr_col = fields_norm[cand]
+                break
 
-    hr_bpm = _to_float_or_none(_row_get_ci(match, "hr_bpm", "Hr_Bpm", "HR_BPM"))
-    trusted = _to_float_or_none(_row_get_ci(match, "trusted", "Trusted"))
-    valid_pct_masked = _to_float_or_none(_row_get_ci(match, "valid_pct_masked", "Valid_Pct_Masked"))
-    iqr_bpm = _to_float_or_none(_row_get_ci(match, "iqr_bpm", "Iqr_Bpm"))
+        # Optional extra metrics
+        trusted_col = fields_norm.get("trusted")
+        valid_col = fields_norm.get("valid_pct_masked") or fields_norm.get("valid_pct")
+        iqr_col = fields_norm.get("iqr_bpm")
+        imf_col = fields_norm.get("selected_imf") or fields_norm.get("imf") or fields_norm.get("selected_imf_idx")
 
-    # Apply your reliability rule
-    if trusted is not None and float(trusted) == 0.0:
-        hr_bpm = None
+        for row in reader:
+            # match by stem column if present
+            if key_col and (row.get(key_col, "").strip() == stem):
+                out = _normalize_dict(row)
+                out["_hr_col"] = hr_col
+                out["_trusted_col"] = trusted_col
+                out["_valid_col"] = valid_col
+                out["_iqr_col"] = iqr_col
+                out["_imf_col"] = imf_col
+                return out
 
-    # If CSV has selected_imf (optional)
-    selected_imf = _to_float_or_none(_row_get_ci(match, "selected_imf", "Selected_Imf"))
+        # fallback: try match by filename-like columns if stem col missing
+        if not key_col:
+            for row in csv.DictReader(THESIS_CSV.open("r", encoding="utf-8", newline="")):
+                out = _normalize_dict(row)
+                for v in out.values():
+                    if isinstance(v, str) and stem in v:
+                        out["_hr_col"] = hr_col
+                        out["_trusted_col"] = trusted_col
+                        out["_valid_col"] = valid_col
+                        out["_iqr_col"] = iqr_col
+                        out["_imf_col"] = imf_col
+                        return out
 
-    return {
-        "ok": 1,
-        "subject": subject_id,
-        "condition": condition,
-        "modality": modality,
-        "file": None,
-        "stem": stem,
-        "hr_method": "thesis_precomputed",
-        "hr_bpm": hr_bpm,
-        "trusted": trusted if trusted is not None else 1,
-        "min_valid_pct": float(min_valid_pct),
-        "valid_pct_masked": valid_pct_masked,
-        "iqr_bpm": iqr_bpm,
-        "selected_imf": selected_imf if selected_imf is not None else 1,
-        "saved": {"summary_metrics_csv": None, "download_url": None},
-    }
+    return None
+
+def _safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def _write_summary_csv(payload: dict, out_path: pathlib.Path):
+    keys = [
+        "timestamp", "subject", "condition", "modality", "stem",
+        "hr_method", "hr_bpm", "trusted", "min_valid_pct",
+        "valid_pct_masked", "iqr_bpm", "selected_imf",
+    ]
+    row = {k: payload.get(k) for k in keys}
+    row["timestamp"] = datetime.utcnow().isoformat()
+
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerow(row)
+
+@app.get("/downloads/{filename}", include_in_schema=False)
+def download_file(filename: str):
+    # basic safety
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="bad_filename")
+
+    fpath = DOWNLOAD_DIR / filename
+    if not fpath.exists():
+        raise HTTPException(status_code=404, detail="not_found")
+    return FileResponse(str(fpath), filename=filename, media_type="text/csv")
 
 @app.post("/upload_video")
 async def upload_video(
@@ -164,89 +180,139 @@ async def upload_video(
     min_valid_pct: float = Form(50.0),
     save: int = Form(0),
 ):
-    # Save upload to disk (still useful for traceability)
+    # normalize these
+    subject_id = (subject_id or "S01").strip()
+    condition = (condition or "rest").strip().lower()
+    modality = (modality or "face").strip().lower()
+    method = (method or "thesis_precomputed").strip()
+
+    stem = f"{subject_id}_{condition}_{modality}"
+
+    # Save upload to disk (always, because FastAPI needs a real file path for the script)
     ext = pathlib.Path(file.filename or "").suffix.lower()
     if ext not in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
         ext = ".mp4"
 
-    safe_name = f"{subject_id}_{condition}_{modality}_{uuid.uuid4().hex}{ext}"
+    safe_name = f"{stem}_{uuid.uuid4().hex}{ext}"
     dst_path = UPLOAD_DIR / safe_name
 
     try:
-        with dst_path.open("wb") as f_out:
+        with dst_path.open("wb") as f:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
-                f_out.write(chunk)
+                f.write(chunk)
 
-        # ✅ IMPORTANT: thesis_precomputed path should NOT run the script
+        # ---------- CASE A: thesis_precomputed (lookup only; skip script) ----------
         if method == "thesis_precomputed":
-            data = lookup_thesis_precomputed(subject_id, condition, modality, min_valid_pct)
-            data["file"] = str(dst_path)
+            row = _find_row_in_thesis_csv(stem)
+            if row is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "ok": 0,
+                        "error": "not_found_in_thesis_csv",
+                        "stem": stem,
+                        "looked_for": str(THESIS_CSV),
+                    },
+                )
 
-            if int(save) == 1 and data.get("ok") == 1:
-                csv_name = f"summary_{data['stem']}_{uuid.uuid4().hex[:8]}.csv"
-                csv_path = DOWNLOAD_DIR / csv_name
+            # extract values robustly
+            hr_val = _safe_float(row.get("hr_bpm"), None)
+            if hr_val is None:
+                hr_val = _safe_float(row.get("hr"), None)
+            trusted_val = _safe_float(row.get("trusted"), 1.0)
+            valid_val = _safe_float(row.get("valid_pct_masked"), _safe_float(row.get("valid_pct"), 100.0))
+            iqr_val = _safe_float(row.get("iqr_bpm"), None)
+            imf_val = _safe_float(row.get("selected_imf"), None)
 
-                with csv_path.open("w", newline="", encoding="utf-8") as f_csv:
-                    writer = csv.DictWriter(f_csv, fieldnames=list(data.keys()))
-                    writer.writeheader()
-                    writer.writerow(data)
+            payload = {
+                "ok": 1,
+                "subject": subject_id,
+                "condition": condition,
+                "modality": modality,
+                "file": str(dst_path),
+                "stem": stem,
+                "hr_method": "thesis_precomputed",
+                "hr_bpm": hr_val,
+                "trusted": trusted_val,
+                "min_valid_pct": float(min_valid_pct),
+                "valid_pct_masked": valid_val,
+                "iqr_bpm": iqr_val,
+                "selected_imf": int(imf_val) if imf_val is not None else None,
+                "saved": {"summary_metrics_csv": None, "download_url": None},
+            }
 
-                base = str(request.base_url).rstrip("/")
-                data["saved"]["summary_metrics_csv"] = str(csv_path)
-                data["saved"]["download_url"] = f"{base}/downloads/{csv_name}"
+        # ---------- CASE B: run pipeline script ----------
+        else:
+            cmd = [
+                sys.executable, str(SCRIPT_PATH),
+                "--video", str(dst_path),
+                "--subject", str(subject_id),
+                "--condition", str(condition),
+                "--modality", str(modality),
+                "--outdir", str(OUTPUT_DIR),
+                "--method", str(method),
+                "--min_valid_pct", str(min_valid_pct),
+                "--save", str(int(save)),
+                "--thesis_root", str(THESIS_ROOT),
+            ]
 
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+
+            if proc.returncode != 0:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "ok": 0,
+                        "error": "Pipeline failed",
+                        "returncode": proc.returncode,
+                        "cmd": cmd,
+                        "stdout": (proc.stdout or "")[-4000:],
+                        "stderr": (proc.stderr or "")[-4000:],
+                    },
+                )
+
+            raw = _parse_last_json_line(proc.stdout)
+            payload = _normalize_dict(raw)
+
+            # enforce standard keys that your frontend expects
+            payload.setdefault("ok", 1)
+            payload.setdefault("subject", subject_id)
+            payload.setdefault("condition", condition)
+            payload.setdefault("modality", modality)
+            payload.setdefault("stem", stem)
+            payload.setdefault("hr_method", method)
+            payload.setdefault("file", str(dst_path))
+            payload.setdefault("min_valid_pct", float(min_valid_pct))
+
+            # reliability rule (only if trusted == 0)
+            trusted_val = _safe_float(payload.get("trusted"), 0.0)
+            if trusted_val == 0.0:
+                payload["hr_bpm"] = None
+
+            payload["saved"] = payload.get("saved") or {"summary_metrics_csv": None, "download_url": None}
+
+        # ---------- Saving summary CSV + download URL ----------
+        if int(save) == 1:
+            csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
+            csv_path = DOWNLOAD_DIR / csv_name
+            _write_summary_csv(payload, csv_path)
+
+            base = str(request.base_url).rstrip("/")  # e.g. https://rppg-server-pack.onrender.com
+            payload["saved"] = {
+                "summary_metrics_csv": str(csv_path),
+                "download_url": f"{base}/downloads/{csv_name}",
+            }
+        else:
             # cleanup upload if save==0
-            if int(save) == 0:
-                try:
-                    dst_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-            return JSONResponse(content=data)
-
-        # Otherwise run the pipeline script (for non-precomputed methods)
-        cmd = [
-            sys.executable, str(SCRIPT_PATH),
-            "--video", str(dst_path),
-            "--subject", str(subject_id),
-        ]
-
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        if proc.returncode != 0:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "ok": 0,
-                    "error": "Pipeline failed",
-                    "returncode": proc.returncode,
-                    "cmd": cmd,
-                    "stdout": proc.stdout[-4000:],
-                    "stderr": proc.stderr[-4000:],
-                },
-            )
-
-        data = _parse_last_json_line(proc.stdout)
-
-        # reliability-aware: if trusted==0 -> hr_bpm = null
-        try:
-            trusted_val = float(data.get("trusted", 0))
-        except Exception:
-            trusted_val = 0.0
-
-        if trusted_val == 0.0:
-            data["hr_bpm"] = None
-
-        if int(save) == 0:
             try:
                 dst_path.unlink(missing_ok=True)
             except Exception:
                 pass
 
-        return JSONResponse(content=data)
+        return JSONResponse(content=payload)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"ok": 0, "error": str(e)})
