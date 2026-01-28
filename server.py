@@ -3,33 +3,32 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-import os
 import csv
 import json
 import sys
 import uuid
 import pathlib
 import subprocess
-from datetime import datetime
 
 APP_VERSION = "0.2.0"
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "outputs" / "server_results"
+DOWNLOAD_DIR = OUTPUT_DIR / "downloads"
 SCRIPT_PATH = BASE_DIR / "realworld_demo_rppg_single.py"
 
-# Thesis precomputed CSV
 THESIS_ROOT = BASE_DIR / "thesis_pipeline"
 THESIS_CSV = THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="rPPG Server", version=APP_VERSION)
 
-# Serve saved CSVs (and anything else you drop in OUTPUT_DIR)
-app.mount("/downloads", StaticFiles(directory=str(OUTPUT_DIR)), name="downloads")
+# Serve saved CSVs
+app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
 
 # CORS
 app.add_middleware(
@@ -50,9 +49,10 @@ def healthz():
         "ok": True,
         "version": APP_VERSION,
         "thesis_root": str(THESIS_ROOT),
+        "thesis_csv": str(THESIS_CSV),
         "thesis_csv_exists": THESIS_CSV.exists(),
-        "upload_dir": str(UPLOAD_DIR),
-        "output_dir": str(OUTPUT_DIR),
+        "script_path": str(SCRIPT_PATH),
+        "script_exists": SCRIPT_PATH.exists(),
     }
 
 def _parse_last_json_line(stdout_text: str) -> dict:
@@ -65,18 +65,93 @@ def _parse_last_json_line(stdout_text: str) -> dict:
                 continue
     return {"ok": 0, "error": "No JSON line found in stdout", "stdout_tail": lines[-10:]}
 
-def _public_base_url(request: Request) -> str:
-    # Render usually provides this; fallback to request base URL
-    env_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-    if env_url:
-        return env_url.rstrip("/")
-    return str(request.base_url).rstrip("/")
+def _row_get_ci(row: dict, *keys: str):
+    """Case-insensitive dict key lookup."""
+    lower_map = {str(k).lower(): k for k in row.keys()}
+    for key in keys:
+        k = lower_map.get(key.lower())
+        if k is not None:
+            return row.get(k)
+    return None
 
-def _safe_float(x, default=None):
+def _to_float_or_none(x):
     try:
-        return float(x)
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return None
+        return float(s)
     except Exception:
-        return default
+        return None
+
+def lookup_thesis_precomputed(subject_id: str, condition: str, modality: str, min_valid_pct: float):
+    if not THESIS_CSV.exists():
+        return {
+            "ok": 0,
+            "error": "thesis_summary_missing_on_server",
+            "looked_for": str(THESIS_CSV),
+        }
+
+    stem = f"{subject_id}_{condition}_{modality}"
+
+    with THESIS_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    # Try match by 'stem' first, then by (subject, condition, modality)
+    match = None
+    for row in rows:
+        row_stem = _row_get_ci(row, "stem")
+        if row_stem and str(row_stem).strip() == stem:
+            match = row
+            break
+
+    if match is None:
+        for row in rows:
+            r_sub = _row_get_ci(row, "subject", "subject_id")
+            r_cond = _row_get_ci(row, "condition")
+            r_mod = _row_get_ci(row, "modality")
+            if (str(r_sub).strip() == subject_id) and (str(r_cond).strip() == condition) and (str(r_mod).strip() == modality):
+                match = row
+                break
+
+    if match is None:
+        return {
+            "ok": 0,
+            "error": "no_matching_row_in_thesis_csv",
+            "stem": stem,
+            "hint": "Check if your CSV has 'stem' or subject/condition/modality columns, and that values match exactly.",
+        }
+
+    hr_bpm = _to_float_or_none(_row_get_ci(match, "hr_bpm", "Hr_Bpm", "HR_BPM"))
+    trusted = _to_float_or_none(_row_get_ci(match, "trusted", "Trusted"))
+    valid_pct_masked = _to_float_or_none(_row_get_ci(match, "valid_pct_masked", "Valid_Pct_Masked"))
+    iqr_bpm = _to_float_or_none(_row_get_ci(match, "iqr_bpm", "Iqr_Bpm"))
+
+    # Apply your reliability rule
+    if trusted is not None and float(trusted) == 0.0:
+        hr_bpm = None
+
+    # If CSV has selected_imf (optional)
+    selected_imf = _to_float_or_none(_row_get_ci(match, "selected_imf", "Selected_Imf"))
+
+    return {
+        "ok": 1,
+        "subject": subject_id,
+        "condition": condition,
+        "modality": modality,
+        "file": None,
+        "stem": stem,
+        "hr_method": "thesis_precomputed",
+        "hr_bpm": hr_bpm,
+        "trusted": trusted if trusted is not None else 1,
+        "min_valid_pct": float(min_valid_pct),
+        "valid_pct_masked": valid_pct_masked,
+        "iqr_bpm": iqr_bpm,
+        "selected_imf": selected_imf if selected_imf is not None else 1,
+        "saved": {"summary_metrics_csv": None, "download_url": None},
+    }
 
 @app.post("/upload_video")
 async def upload_video(
@@ -89,19 +164,7 @@ async def upload_video(
     min_valid_pct: float = Form(50.0),
     save: int = Form(0),
 ):
-    # Fail fast if thesis_precomputed is requested but CSV isn't present
-    if method == "thesis_precomputed" and not THESIS_CSV.exists():
-        return JSONResponse(
-            status_code=500,
-            content={
-                "ok": 0,
-                "error": "thesis_summary_missing_on_server",
-                "looked_for": str(THESIS_CSV),
-                "hint": "Confirm thesis_pipeline is committed & deployed and THESIS_ROOT is correct.",
-            },
-        )
-
-    # Save upload
+    # Save upload to disk (still useful for traceability)
     ext = pathlib.Path(file.filename or "").suffix.lower()
     if ext not in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
         ext = ".mp4"
@@ -110,24 +173,45 @@ async def upload_video(
     dst_path = UPLOAD_DIR / safe_name
 
     try:
-        with dst_path.open("wb") as f:
+        with dst_path.open("wb") as f_out:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
-                f.write(chunk)
+                f_out.write(chunk)
 
+        # ✅ IMPORTANT: thesis_precomputed path should NOT run the script
+        if method == "thesis_precomputed":
+            data = lookup_thesis_precomputed(subject_id, condition, modality, min_valid_pct)
+            data["file"] = str(dst_path)
+
+            if int(save) == 1 and data.get("ok") == 1:
+                csv_name = f"summary_{data['stem']}_{uuid.uuid4().hex[:8]}.csv"
+                csv_path = DOWNLOAD_DIR / csv_name
+
+                with csv_path.open("w", newline="", encoding="utf-8") as f_csv:
+                    writer = csv.DictWriter(f_csv, fieldnames=list(data.keys()))
+                    writer.writeheader()
+                    writer.writerow(data)
+
+                base = str(request.base_url).rstrip("/")
+                data["saved"]["summary_metrics_csv"] = str(csv_path)
+                data["saved"]["download_url"] = f"{base}/downloads/{csv_name}"
+
+            # cleanup upload if save==0
+            if int(save) == 0:
+                try:
+                    dst_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            return JSONResponse(content=data)
+
+        # Otherwise run the pipeline script (for non-precomputed methods)
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
             "--subject", str(subject_id),
-            "--condition", str(condition),
-            "--modality", str(modality),
-            "--outdir", str(OUTPUT_DIR),
-            "--method", str(method),
-            "--min_valid_pct", str(min_valid_pct),
-            "--save", str(int(save)),
-            "--thesis_root", str(THESIS_ROOT),
         ]
 
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -148,59 +232,14 @@ async def upload_video(
         data = _parse_last_json_line(proc.stdout)
 
         # reliability-aware: if trusted==0 -> hr_bpm = null
-        trusted_val = _safe_float(data.get("trusted", 0), 0.0)
+        try:
+            trusted_val = float(data.get("trusted", 0))
+        except Exception:
+            trusted_val = 0.0
+
         if trusted_val == 0.0:
             data["hr_bpm"] = None
 
-        # --- NEW: SAVE CSV + RETURN DOWNLOAD URL ---
-        saved = {}
-        if int(save) == 1:
-            base = _public_base_url(request)
-
-            # create a per-upload metrics CSV
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            stem = str(data.get("stem") or f"{subject_id}_{condition}_{modality}")
-            csv_name = f"metrics_{stem}_{ts}.csv".replace(" ", "_")
-            csv_path = OUTPUT_DIR / csv_name
-
-            row = {
-                "timestamp_utc": ts,
-                "subject": data.get("subject", subject_id),
-                "condition": data.get("condition", condition),
-                "modality": data.get("modality", modality),
-                "hr_method": data.get("hr_method", method),
-                "hr_bpm": data.get("hr_bpm"),
-                "trusted": data.get("trusted"),
-                "min_valid_pct": data.get("min_valid_pct", min_valid_pct),
-                "valid_pct_masked": data.get("valid_pct_masked"),
-                "iqr_bpm": data.get("iqr_bpm"),
-                "selected_imf": data.get("selected_imf"),
-                "video_file_saved": str(dst_path),
-            }
-
-            with csv_path.open("w", newline="", encoding="utf-8") as fcsv:
-                writer = csv.DictWriter(fcsv, fieldnames=list(row.keys()))
-                writer.writeheader()
-                writer.writerow(row)
-
-            per_upload_url = f"{base}/downloads/{csv_name}"
-            saved["summary_metrics_csv"] = per_upload_url
-
-            # append to a global log
-            log_path = OUTPUT_DIR / "uploads_log.csv"
-            log_exists = log_path.exists()
-            with log_path.open("a", newline="", encoding="utf-8") as flog:
-                writer = csv.DictWriter(flog, fieldnames=list(row.keys()))
-                if not log_exists:
-                    writer.writeheader()
-                writer.writerow(row)
-
-            saved["uploads_log_csv"] = f"{base}/downloads/uploads_log.csv"
-
-        # attach saved info (even if empty)
-        data["saved"] = saved
-
-        # cleanup upload if save==0
         if int(save) == 0:
             try:
                 dst_path.unlink(missing_ok=True)
