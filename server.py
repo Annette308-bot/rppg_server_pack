@@ -7,10 +7,12 @@ import sys
 import uuid
 import pathlib
 import subprocess
+import os
 
-APP_VERSION = "0.1.4"  # serve UI at / and keep hr_bpm-only API output
+APP_VERSION = "0.1.5"  # Serve UI at / + hr_bpm-only API output + better health debug
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
+
 WEBUI_DIR = BASE_DIR / "webui"
 INDEX_HTML = WEBUI_DIR / "index.html"
 
@@ -32,7 +34,7 @@ app = FastAPI(title="rPPG Server", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later restrict to your UI domain
+    allow_origins=["*"],  # you can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,12 +45,12 @@ ALLOWED_MODALITIES = {"face", "palm"}
 ALLOWED_METHODS = {"thesis_precomputed", "fft"}  # extend later
 
 
-# ---------------- UI routes ----------------
+# ---------- UI routes ----------
 @app.get("/", include_in_schema=False)
 def root():
-    # Serve UI at root if present (best for supervisor link)
+    # Serve the UI on the main URL
     if INDEX_HTML.exists():
-        return FileResponse(str(INDEX_HTML), media_type="text/html")
+        return FileResponse(str(INDEX_HTML), media_type="text/html; charset=utf-8")
     # fallback
     return RedirectResponse(url="/docs")
 
@@ -56,22 +58,27 @@ def root():
 @app.get("/ui", include_in_schema=False)
 def ui():
     if INDEX_HTML.exists():
-        return FileResponse(str(INDEX_HTML), media_type="text/html")
+        return FileResponse(str(INDEX_HTML), media_type="text/html; charset=utf-8")
     return RedirectResponse(url="/docs")
 
 
-# ---------------- basic endpoints ----------------
+# ---------- Debug/health ----------
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return {
         "ok": True,
         "version": APP_VERSION,
+        "cwd": os.getcwd(),
+        "__file__": str(pathlib.Path(__file__).resolve()),
+        "base_dir": str(BASE_DIR),
+        "ui_index": str(INDEX_HTML),
+        "ui_exists": INDEX_HTML.exists(),
         "thesis_csv": str(THESIS_CSV),
         "thesis_csv_exists": THESIS_CSV.exists(),
-        "ui_exists": INDEX_HTML.exists(),
     }
 
 
+# ---------- Downloads ----------
 @app.get("/downloads/{name}", include_in_schema=False)
 def download_file(name: str):
     path = DOWNLOAD_DIR / name
@@ -80,7 +87,6 @@ def download_file(name: str):
     return FileResponse(str(path), media_type="text/csv", filename=name)
 
 
-# ---------------- helpers ----------------
 def _to_float(x):
     try:
         if x is None:
@@ -110,9 +116,8 @@ def thesis_lookup(stem: str):
     Look up a row from the thesis CSV by stem.
 
     NOTE:
-    - Thesis CSV stores HR under 'median_bpm' (legacy).
-    - We KEEP reading median_bpm from disk,
-      but the API OUTPUT uses ONLY 'hr_bpm'.
+    - Thesis CSV may store HR under 'median_bpm' (legacy).
+    - API OUTPUT returns ONLY 'hr_bpm' (no 'median_bpm' key anywhere).
     """
     if not THESIS_CSV.exists():
         return None
@@ -124,7 +129,6 @@ def thesis_lookup(stem: str):
             if row_stem != stem:
                 continue
 
-            # read from thesis CSV (handle possible header spellings)
             hr_bpm = _to_float(
                 row.get("median_bpm")
                 or row.get("Median_Bpm")
@@ -140,7 +144,6 @@ def thesis_lookup(stem: str):
             if iqr_bpm is None and (q1_bpm is not None) and (q3_bpm is not None):
                 iqr_bpm = q3_bpm - q1_bpm
 
-            # IMPORTANT: no median_bpm key returned
             return {
                 "stem": stem,
                 "hr_bpm": hr_bpm,
@@ -154,7 +157,7 @@ def thesis_lookup(stem: str):
     return None
 
 
-# ---------------- main API ----------------
+# ---------- Main API ----------
 @app.post("/upload_video")
 async def upload_video(
     request: Request,
@@ -167,7 +170,6 @@ async def upload_video(
     save: int = Form(0),
     timeout_sec: int = Form(120),
 ):
-    # sanitize
     subject_id = (subject_id or "S01").strip()
     condition = (condition or "rest").strip().lower()
     modality = (modality or "face").strip().lower()
@@ -182,7 +184,6 @@ async def upload_video(
 
     stem = f"{subject_id}_{condition}_{modality}"
 
-    # file extension
     ext = pathlib.Path(file.filename or "").suffix.lower()
     if ext not in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
         ext = ".mp4"
@@ -190,7 +191,7 @@ async def upload_video(
     safe_name = f"{stem}_{uuid.uuid4().hex}{ext}"
     dst_path = UPLOAD_DIR / safe_name
 
-    # save upload
+    # Save upload
     with dst_path.open("wb") as f:
         while True:
             chunk = await file.read(1024 * 1024)
@@ -198,7 +199,6 @@ async def upload_video(
                 break
             f.write(chunk)
 
-    # base response
     out = {
         "ok": 1,
         "subject": subject_id,
@@ -221,7 +221,6 @@ async def upload_video(
         else:
             out["thesis"] = thesis_row
 
-            # trust gate based on valid_pct_masked
             vpm = thesis_row.get("valid_pct_masked")
             if (vpm is not None) and (float(vpm) < float(min_valid_pct)):
                 out["trusted"] = 0
@@ -234,7 +233,6 @@ async def upload_video(
                     out["error"] = "hr_missing_in_thesis_csv_row"
 
     else:
-        # future: run pipeline
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
@@ -247,7 +245,15 @@ async def upload_video(
             "--save", str(int(save)),
             "--thesis_root", str(THESIS_ROOT),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_sec))
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_sec))
+        except subprocess.TimeoutExpired:
+            return JSONResponse(
+                status_code=504,
+                content={"ok": 0, "error": "pipeline_timeout", "timeout_sec": int(timeout_sec), "cmd": cmd},
+            )
+
         if proc.returncode != 0:
             return JSONResponse(
                 status_code=500,
@@ -264,7 +270,7 @@ async def upload_video(
         out["trusted"] = 0
         out["hr_bpm"] = None
 
-    # always write summary CSV
+    # Save a small CSV and give a download URL
     csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -278,7 +284,7 @@ async def upload_video(
         "download_url": f"{base}/downloads/{csv_name}",
     }
 
-    # cleanup upload if save==0
+    # cleanup uploaded video if save==0
     if int(save) == 0:
         try:
             dst_path.unlink(missing_ok=True)
