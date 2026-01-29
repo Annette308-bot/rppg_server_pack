@@ -1,218 +1,504 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>rPPG Demo</title>
-  <style>
-    body { font-family: system-ui, Arial; max-width: 720px; margin: 28px auto; padding: 0 16px; }
-    .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin: 14px 0; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    button { padding: 10px 14px; border-radius: 12px; border: 1px solid #111; background: #111; color: #fff; cursor: pointer; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    input, select { padding: 10px; border-radius: 12px; border: 1px solid #ccc; }
-    .muted { color: #666; font-size: 0.95em; }
-    .ok { color: #0a7; font-weight: 600; }
-    .bad { color: #c20; font-weight: 600; }
-    pre { white-space: pre-wrap; word-break: break-word; background: #f6f6f6; padding: 12px; border-radius: 12px; }
-    .big { font-size: 28px; font-weight: 700; }
-    .pillBtn { background:#fff; color:#111; border:1px solid #111; }
-    a { color: #0a58ca; }
-    .divider { height: 1px; background: #eee; margin: 12px 0; }
-  </style>
-</head>
-<body>
-  <h2>rPPG Demo (Thesis Precomputed)</h2>
-  <p class="muted">Upload a face/palm video → Analyze → get HR + SpO₂ + download CSV.</p>
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-  <div class="card">
-    <div class="row" style="justify-content: space-between;">
-      <div class="muted">Simple mode</div>
-      <button id="settingsBtn" type="button" class="pillBtn" onclick="toggleSettings()">Settings</button>
-    </div>
+import csv
+import sys
+import uuid
+import time
+import pathlib
+import subprocess
 
-    <div id="settings" style="display:none; margin-top:12px;">
-      <div class="row">
-        <label>API URL:</label>
-        <input id="apiBase" style="flex:1; min-width: 260px;" />
-      </div>
-      <p class="muted" style="margin:8px 0 0;">(Auto-filled. Change only if you use another server.)</p>
-      <div class="divider"></div>
-    </div>
+APP_VERSION = "0.2.0"  # Option-B: real pipeline support for arbitrary uploads
 
-    <div class="row" style="margin-top:12px;">
-      <label>Video:</label>
-      <input id="file" type="file" accept="video/*" />
-    </div>
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+WEBUI_DIR = BASE_DIR / "webui"
+INDEX_HTML = WEBUI_DIR / "index.html"
 
-    <div class="row" style="margin-top:12px;">
-      <label>Subject:</label>
-      <input id="subject" value="S01" style="width:120px;" />
+UPLOAD_DIR = BASE_DIR / "uploads"
+OUTPUT_DIR = BASE_DIR / "outputs" / "server_results"
+DOWNLOAD_DIR = OUTPUT_DIR / "downloads"
+SCRIPT_PATH = BASE_DIR / "realworld_demo_rppg_single.py"
 
-      <label>Condition:</label>
-      <select id="condition">
-        <option value="rest">rest</option>
-        <option value="breath">breath</option>
-        <option value="exercise">exercise</option>
-      </select>
+THESIS_ROOT = BASE_DIR / "thesis_pipeline"
+THESIS_HR_CSV = THESIS_ROOT / "08_hilbert" / "hilbert_hr_summary_all.csv"
+THESIS_SPO2_DIR = THESIS_ROOT / "06_spo2"
 
-      <label>Modality:</label>
-      <select id="modality">
-        <option value="palm">palm</option>
-        <option value="face">face</option>
-      </select>
+WEBUI_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-      <label>Min valid %:</label>
-      <input id="minValid" type="number" value="50" style="width:90px;" />
-    </div>
+app = FastAPI(title="rPPG Server", version=APP_VERSION)
 
-    <div class="row" style="margin-top:14px;">
-      <button id="btn" onclick="run()">Analyze</button>
-      <span id="status" class="muted"></span>
-    </div>
-  </div>
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # later restrict to your UI domain if you want
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  <div class="card" id="resultCard" style="display:none;">
-    <h3>Result</h3>
-    <div id="summary"></div>
+ALLOWED_CONDITIONS = {"rest", "breath", "exercise"}
+ALLOWED_MODALITIES = {"face", "palm"}
+ALLOWED_METHODS = {"thesis_precomputed", "fft"}  # extend later
 
-    <div class="row" style="margin-top:10px; gap:16px;">
-      <a id="downloadLink" href="#" style="display:none;" download>Download CSV</a>
-      <button id="toggleBtn" type="button" class="pillBtn" onclick="toggleDetails()" style="display:none;">
-        Show details
-      </button>
-    </div>
 
-    <div id="details" style="display:none; margin-top:12px;">
-      <h4>Details (raw response)</h4>
-      <pre id="raw"></pre>
-    </div>
+# ---------- UI routes ----------
+@app.get("/", include_in_schema=False)
+def root():
+    if INDEX_HTML.exists():
+        return FileResponse(
+            str(INDEX_HTML),
+            media_type="text/html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+    return RedirectResponse(url="/docs")
 
-    <p class="muted">Note: On Render free tier, the service may sleep; first request can take ~30–60s.</p>
-  </div>
 
-<script>
-function defaultApiBase() {
-  if (window.location.protocol === "http:" || window.location.protocol === "https:") {
-    return window.location.origin;
-  }
-  return "https://rppg-server-pack.onrender.com";
-}
+@app.get("/ui", include_in_schema=False)
+def ui():
+    if INDEX_HTML.exists():
+        return FileResponse(
+            str(INDEX_HTML),
+            media_type="text/html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
+    return RedirectResponse(url="/docs")
 
-(function init() {
-  const apiEl = document.getElementById("apiBase");
-  if (apiEl) apiEl.value = defaultApiBase();
-})();
 
-function toggleSettings() {
-  const s = document.getElementById("settings");
-  const btn = document.getElementById("settingsBtn");
-  const open = s.style.display !== "none";
-  s.style.display = open ? "none" : "block";
-  btn.textContent = open ? "Settings" : "Hide settings";
-}
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    spo2_files = []
+    if THESIS_SPO2_DIR.exists():
+        spo2_files = sorted([p.name for p in THESIS_SPO2_DIR.glob("*_spo2_trend.csv")])
 
-function toggleDetails() {
-  const details = document.getElementById("details");
-  const btn = document.getElementById("toggleBtn");
-  const isOpen = details.style.display !== "none";
-  details.style.display = isOpen ? "none" : "block";
-  btn.textContent = isOpen ? "Show details" : "Hide details";
-}
-
-async function run() {
-  const apiBaseEl = document.getElementById("apiBase");
-  const apiBase = (apiBaseEl ? apiBaseEl.value : defaultApiBase()).replace(/\/+$/,"");
-
-  const fileInput = document.getElementById("file");
-  const btn = document.getElementById("btn");
-  const status = document.getElementById("status");
-
-  const subject = document.getElementById("subject").value || "S01";
-  const condition = document.getElementById("condition").value;
-  const modality = document.getElementById("modality").value;
-  const minValid = document.getElementById("minValid").value || "50";
-
-  if (!fileInput.files || fileInput.files.length === 0) {
-    alert("Please choose a video file first.");
-    return;
-  }
-
-  btn.disabled = true;
-  status.textContent = "Uploading & analyzing…";
-
-  try {
-    const fd = new FormData();
-    fd.append("file", fileInput.files[0]);
-    fd.append("subject_id", subject);
-    fd.append("condition", condition);
-    fd.append("modality", modality);
-    fd.append("method", "thesis_precomputed");
-    fd.append("min_valid_pct", minValid);
-    fd.append("save", "1");
-    fd.append("timeout_sec", "240");
-
-    const res = await fetch(`${apiBase}/upload_video`, { method: "POST", body: fd, cache: "no-store" });
-    const data = await res.json();
-
-    document.getElementById("resultCard").style.display = "block";
-
-    document.getElementById("details").style.display = "none";
-    const toggleBtn = document.getElementById("toggleBtn");
-    toggleBtn.style.display = "inline-block";
-    toggleBtn.textContent = "Show details";
-    document.getElementById("raw").textContent = JSON.stringify(data, null, 2);
-
-    // HR
-    const hr = data.hr_bpm;
-    const trusted = data.trusted;
-    const hrQuality = trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
-    const hrText = (hr === null || hr === undefined) ? "—" : Number(hr).toFixed(1);
-
-    // SpO2
-    const spo2 = data.spo2_pct;
-    const spo2Trusted = data.spo2_trusted;
-    const spo2Quality = spo2Trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
-    const spo2Text = (spo2 === null || spo2 === undefined) ? "—" : Number(spo2).toFixed(1);
-
-    document.getElementById("summary").innerHTML = `
-      <div class="row">
-        <div><b>Stem:</b> ${data.stem || ""}</div>
-      </div>
-
-      <div class="row" style="margin-top:10px;">
-        <div class="big">HR: ${hrText} bpm</div>
-        <div style="font-size:18px;"><b>HR Quality:</b> ${hrQuality}</div>
-      </div>
-
-      <div class="row" style="margin-top:6px;">
-        <div class="big">SpO₂: ${spo2Text} %</div>
-        <div style="font-size:18px;"><b>SpO₂ Quality:</b> ${spo2Quality}</div>
-      </div>
-
-      ${(!trusted ? `<p class="bad">Low HR signal quality. Try more light, less motion, and keep ROI steady.</p>` : ``)}
-      ${(!spo2Trusted ? `<p class="bad">Low SpO₂ quality. Try more stable lighting and reduce motion.</p>` : ``)}
-    `;
-
-    const link = document.getElementById("downloadLink");
-    const url = data?.saved?.download_url;
-    if (url) {
-      link.href = url;
-      link.style.display = "inline-block";
-      link.textContent = "Download CSV";
-    } else {
-      link.style.display = "none";
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "cwd": str(pathlib.Path.cwd()),
+        "__file__": str(pathlib.Path(__file__).resolve()),
+        "ui_index": str(INDEX_HTML),
+        "ui_exists": INDEX_HTML.exists(),
+        "thesis_hr_csv": str(THESIS_HR_CSV),
+        "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
+        "thesis_spo2_dir": str(THESIS_SPO2_DIR),
+        "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
+        "spo2_files_count": len(spo2_files),
+        "spo2_files_sample": spo2_files[:10],
     }
 
-    status.textContent = "Done.";
-  } catch (e) {
-    console.error(e);
-    status.textContent = "Error. Check console.";
-    alert("Request failed. If Render is sleeping, retry.");
-  } finally {
-    btn.disabled = false;
-  }
-}
-</script>
-</body>
-</html>
+
+@app.get("/downloads/{name}", include_in_schema=False)
+def download_file(name: str):
+    path = DOWNLOAD_DIR / name
+    if not path.exists():
+        return JSONResponse(status_code=404, content={"ok": 0, "error": "file_not_found"})
+    return FileResponse(str(path), media_type="text/csv", filename=name)
+
+
+def _to_float(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _to_int(x):
+    try:
+        if x is None:
+            return None
+        s = str(x).strip()
+        if s == "":
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2 == 1:
+        return float(vals[mid])
+    return float(vals[mid - 1] + vals[mid]) / 2.0
+
+
+def thesis_hr_lookup(stem: str):
+    """
+    Read HR from thesis HR summary CSV.
+    Thesis CSV may store HR under 'median_bpm' (legacy).
+    API OUTPUT uses ONLY 'hr_bpm'.
+    """
+    if not THESIS_HR_CSV.exists():
+        return None
+
+    with THESIS_HR_CSV.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            row_stem = (row.get("stem") or "").strip()
+            if row_stem != stem:
+                continue
+
+            hr_bpm = _to_float(
+                row.get("median_bpm")
+                or row.get("Median_Bpm")
+                or row.get("MEDIAN_BPM")
+                or row.get("hr_bpm")
+            )
+
+            selected_imf = _to_int(row.get("selected_imf"))
+            valid_pct_masked = _to_float(row.get("valid_pct_masked"))
+            q1_bpm = _to_float(row.get("q1_bpm"))
+            q3_bpm = _to_float(row.get("q3_bpm"))
+            iqr_bpm = _to_float(row.get("iqr_bpm"))
+
+            if iqr_bpm is None and (q1_bpm is not None) and (q3_bpm is not None):
+                iqr_bpm = q3_bpm - q1_bpm
+
+            return {
+                "stem": stem,
+                "hr_bpm": hr_bpm,
+                "valid_pct_masked": valid_pct_masked,
+                "q1_bpm": q1_bpm,
+                "q3_bpm": q3_bpm,
+                "iqr_bpm": iqr_bpm,
+                "selected_imf": selected_imf,
+            }
+
+    return None
+
+
+def _pick_spo2_column(fieldnames):
+    if not fieldnames:
+        return None
+    lowered = [c.lower() for c in fieldnames]
+    # strong candidates first
+    candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value"]
+    for cand in candidates:
+        for i, col in enumerate(lowered):
+            if col == cand:
+                return fieldnames[i]
+    # fallback: anything containing "spo2"
+    for i, col in enumerate(lowered):
+        if "spo2" in col:
+            return fieldnames[i]
+    return None
+
+
+def thesis_spo2_lookup(stem: str):
+    """
+    Read SpO2 from per-clip trend file:
+      thesis_pipeline/06_spo2/{stem}_spo2_trend.csv
+    Return a single summary value (median) + basic stats.
+    """
+    if not THESIS_SPO2_DIR.exists():
+        return None
+
+    path = THESIS_SPO2_DIR / f"{stem}_spo2_trend.csv"
+    if not path.exists():
+        return None
+
+    values = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        spo2_col = _pick_spo2_column(r.fieldnames)
+
+        if spo2_col is None:
+            return {
+                "stem": stem,
+                "file": str(path),
+                "spo2_pct": None,
+                "n": 0,
+                "error": "no_spo2_column_found",
+                "columns": r.fieldnames,
+            }
+
+        for row in r:
+            v = _to_float(row.get(spo2_col))
+            if v is None:
+                continue
+            values.append(v)
+
+    if not values:
+        return {
+            "stem": stem,
+            "file": str(path),
+            "spo2_pct": None,
+            "n": 0,
+            "error": "no_numeric_spo2_values",
+        }
+
+    med = _median(values)
+    mn = float(min(values))
+    mx = float(max(values))
+    mean = float(sum(values)) / float(len(values))
+
+    return {
+        "stem": stem,
+        "file": str(path),
+        "spo2_pct": med,  # main value we expose
+        "mean_pct": mean,
+        "min_pct": mn,
+        "max_pct": mx,
+        "n": len(values),
+    }
+
+
+# --------- Real-pipeline helpers ----------
+def _pick_hr_column(fieldnames):
+    if not fieldnames:
+        return None
+    lowered = [c.lower() for c in fieldnames]
+    candidates = ["hr_bpm", "hr", "bpm", "median_bpm", "median_hr"]
+    for cand in candidates:
+        for i, col in enumerate(lowered):
+            if col == cand:
+                return fieldnames[i]
+    for i, col in enumerate(lowered):
+        if "hr" in col or "bpm" in col:
+            return fieldnames[i]
+    return None
+
+
+def _read_first_row_csv(path: pathlib.Path):
+    if not path.exists():
+        return None
+    with path.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            return (r.fieldnames, row)
+    return None
+
+
+def _find_summary_csv(run_dir: pathlib.Path):
+    # common places
+    candidates = [
+        run_dir / "summary_metrics.csv",
+        run_dir / "analysis" / "summary_metrics.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    # search recursively for summary_metrics.csv
+    rec = list(run_dir.glob("**/summary_metrics.csv"))
+    if rec:
+        rec.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return rec[0]
+
+    # fallback: any csv
+    any_csv = list(run_dir.glob("**/*.csv"))
+    if any_csv:
+        any_csv.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return any_csv[0]
+
+    return None
+
+
+@app.post("/upload_video")
+async def upload_video(
+    request: Request,
+    file: UploadFile = File(...),
+    subject_id: str = Form(...),
+    condition: str = Form(...),
+    modality: str = Form(...),
+    method: str = Form("thesis_precomputed"),
+    min_valid_pct: float = Form(50.0),
+    save: int = Form(0),
+    timeout_sec: int = Form(240),
+):
+    subject_id = (subject_id or "S01").strip()
+    condition = (condition or "rest").strip().lower()
+    modality = (modality or "face").strip().lower()
+    method = (method or "thesis_precomputed").strip()
+
+    if condition not in ALLOWED_CONDITIONS:
+        condition = "rest"
+    if modality not in ALLOWED_MODALITIES:
+        modality = "face"
+    if method not in ALLOWED_METHODS:
+        method = "thesis_precomputed"
+
+    stem = f"{subject_id}_{condition}_{modality}"
+
+    ext = pathlib.Path(file.filename or "").suffix.lower()
+    if ext not in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
+        ext = ".mp4"
+
+    safe_name = f"{stem}_{uuid.uuid4().hex}{ext}"
+    dst_path = UPLOAD_DIR / safe_name
+
+    with dst_path.open("wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+    out = {
+        "ok": 1,
+        "subject": subject_id,
+        "condition": condition,
+        "modality": modality,
+        "stem": stem,
+        "hr_method": method,
+        "spo2_method": method,
+        "min_valid_pct": float(min_valid_pct),
+
+        "trusted": 0,
+        "hr_bpm": None,
+        "thesis": None,
+
+        "spo2_trusted": 0,
+        "spo2_pct": None,
+        "spo2": None,
+        "pipeline": None,
+    }
+
+    if method == "thesis_precomputed":
+        # ---- HR ----
+        hr_row = thesis_hr_lookup(stem)
+        if hr_row is None:
+            out["trusted"] = 0
+            out["error"] = "stem_not_found_in_hr_csv"
+        else:
+            out["thesis"] = hr_row
+            vpm = hr_row.get("valid_pct_masked")
+            if (vpm is not None) and (float(vpm) < float(min_valid_pct)):
+                out["trusted"] = 0
+                out["hr_bpm"] = None
+                out["error"] = "below_min_valid_pct"
+            else:
+                out["hr_bpm"] = hr_row.get("hr_bpm")
+                if out["hr_bpm"] is None:
+                    out["trusted"] = 0
+                    out["error"] = "hr_missing_in_hr_csv_row"
+                else:
+                    out["trusted"] = 1
+
+        # ---- SpO2 ----
+        spo2_row = thesis_spo2_lookup(stem)
+        if spo2_row is not None:
+            out["spo2"] = spo2_row
+            out["spo2_pct"] = spo2_row.get("spo2_pct")
+
+            n = spo2_row.get("n") or 0
+            s = spo2_row.get("spo2_pct")
+            if (s is not None) and (n >= 5) and (70.0 <= float(s) <= 100.5):
+                out["spo2_trusted"] = 1
+
+    else:
+        # ---- REAL pipeline ----
+        run_id = uuid.uuid4().hex
+        run_dir = OUTPUT_DIR / f"{stem}_{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable, str(SCRIPT_PATH),
+            "--video", str(dst_path),
+            "--subject", subject_id,
+            "--condition", condition,
+            "--modality", modality,
+            "--outdir", str(run_dir),
+            "--method", method,
+            "--min_valid_pct", str(min_valid_pct),
+            "--save", str(int(save)),
+            "--thesis_root", str(THESIS_ROOT),
+        ]
+
+        t0 = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_sec))
+        if proc.returncode != 0:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": 0,
+                    "error": "pipeline_failed",
+                    "returncode": proc.returncode,
+                    "stdout": proc.stdout[-3000:],
+                    "stderr": proc.stderr[-3000:],
+                    "cmd": cmd,
+                },
+            )
+
+        summary_csv = _find_summary_csv(run_dir)
+        if summary_csv is None or not summary_csv.exists():
+            out["error"] = "no_summary_csv_generated"
+            out["pipeline"] = {
+                "run_dir": str(run_dir),
+                "runtime_sec": round(time.time() - t0, 2),
+            }
+        else:
+            res = _read_first_row_csv(summary_csv)
+            if not res:
+                out["error"] = "summary_csv_empty"
+                out["pipeline"] = {
+                    "run_dir": str(run_dir),
+                    "summary_csv": str(summary_csv),
+                    "runtime_sec": round(time.time() - t0, 2),
+                }
+            else:
+                fieldnames, row = res
+                hr_col = _pick_hr_column(fieldnames)
+                spo2_col = _pick_spo2_column(fieldnames)
+
+                hr_val = _to_float(row.get(hr_col)) if hr_col else None
+                spo2_val = _to_float(row.get(spo2_col)) if spo2_col else None
+
+                out["hr_bpm"] = hr_val
+                out["trusted"] = 1 if hr_val is not None else 0
+
+                out["spo2_pct"] = spo2_val
+                out["spo2_trusted"] = 1 if (spo2_val is not None and 70.0 <= float(spo2_val) <= 100.5) else 0
+
+                out["spo2"] = {
+                    "file": str(summary_csv),
+                    "spo2_pct": spo2_val,
+                }
+
+                out["pipeline"] = {
+                    "run_dir": str(run_dir),
+                    "summary_csv": str(summary_csv),
+                    "runtime_sec": round(time.time() - t0, 2),
+                    "hr_col": hr_col,
+                    "spo2_col": spo2_col,
+                }
+
+    # Always write a small CSV and give a download URL
+    csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
+    csv_path = DOWNLOAD_DIR / csv_name
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "subject", "condition", "modality", "stem",
+            "hr_bpm", "trusted", "hr_method",
+            "spo2_pct", "spo2_trusted", "spo2_method"
+        ])
+        w.writerow([
+            subject_id, condition, modality, stem,
+            out.get("hr_bpm"), out.get("trusted"), out.get("hr_method"),
+            out.get("spo2_pct"), out.get("spo2_trusted"), out.get("spo2_method")
+        ])
+
+    base = str(request.base_url).rstrip("/")
+    out["saved"] = {
+        "summary_metrics_csv": str(csv_path),
+        "download_url": f"{base}/downloads/{csv_name}",
+    }
+
+    if int(save) == 0:
+        try:
+            dst_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    return JSONResponse(content=out)

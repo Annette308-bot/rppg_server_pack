@@ -5,10 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import csv
 import sys
 import uuid
+import time
 import pathlib
 import subprocess
 
-APP_VERSION = "0.1.7"  # HR + SpO2 precomputed + UI no-cache + health debug listing
+APP_VERSION = "0.2.0"  # Option-B: real pipeline support for arbitrary uploads
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 WEBUI_DIR = BASE_DIR / "webui"
@@ -180,11 +181,13 @@ def _pick_spo2_column(fieldnames):
     if not fieldnames:
         return None
     lowered = [c.lower() for c in fieldnames]
-    candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value", "spo2_index"]
+    # strong candidates first
+    candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value"]
     for cand in candidates:
         for i, col in enumerate(lowered):
             if col == cand:
                 return fieldnames[i]
+    # fallback: anything containing "spo2"
     for i, col in enumerate(lowered):
         if "spo2" in col:
             return fieldnames[i]
@@ -250,6 +253,57 @@ def thesis_spo2_lookup(stem: str):
     }
 
 
+# --------- Real-pipeline helpers ----------
+def _pick_hr_column(fieldnames):
+    if not fieldnames:
+        return None
+    lowered = [c.lower() for c in fieldnames]
+    candidates = ["hr_bpm", "hr", "bpm", "median_bpm", "median_hr"]
+    for cand in candidates:
+        for i, col in enumerate(lowered):
+            if col == cand:
+                return fieldnames[i]
+    for i, col in enumerate(lowered):
+        if "hr" in col or "bpm" in col:
+            return fieldnames[i]
+    return None
+
+
+def _read_first_row_csv(path: pathlib.Path):
+    if not path.exists():
+        return None
+    with path.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            return (r.fieldnames, row)
+    return None
+
+
+def _find_summary_csv(run_dir: pathlib.Path):
+    # common places
+    candidates = [
+        run_dir / "summary_metrics.csv",
+        run_dir / "analysis" / "summary_metrics.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+
+    # search recursively for summary_metrics.csv
+    rec = list(run_dir.glob("**/summary_metrics.csv"))
+    if rec:
+        rec.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return rec[0]
+
+    # fallback: any csv
+    any_csv = list(run_dir.glob("**/*.csv"))
+    if any_csv:
+        any_csv.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return any_csv[0]
+
+    return None
+
+
 @app.post("/upload_video")
 async def upload_video(
     request: Request,
@@ -260,7 +314,7 @@ async def upload_video(
     method: str = Form("thesis_precomputed"),
     min_valid_pct: float = Form(50.0),
     save: int = Form(0),
-    timeout_sec: int = Form(120),
+    timeout_sec: int = Form(240),
 ):
     subject_id = (subject_id or "S01").strip()
     condition = (condition or "rest").strip().lower()
@@ -300,13 +354,14 @@ async def upload_video(
         "spo2_method": method,
         "min_valid_pct": float(min_valid_pct),
 
-        "trusted": 1,   # HR trust
+        "trusted": 0,
         "hr_bpm": None,
         "thesis": None,
 
         "spo2_trusted": 0,
         "spo2_pct": None,
         "spo2": None,
+        "pipeline": None,
     }
 
     if method == "thesis_precomputed":
@@ -327,6 +382,8 @@ async def upload_video(
                 if out["hr_bpm"] is None:
                     out["trusted"] = 0
                     out["error"] = "hr_missing_in_hr_csv_row"
+                else:
+                    out["trusted"] = 1
 
         # ---- SpO2 ----
         spo2_row = thesis_spo2_lookup(stem)
@@ -340,19 +397,25 @@ async def upload_video(
                 out["spo2_trusted"] = 1
 
     else:
-        # Future: run real pipeline
+        # ---- REAL pipeline ----
+        run_id = uuid.uuid4().hex
+        run_dir = OUTPUT_DIR / f"{stem}_{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
             "--subject", subject_id,
             "--condition", condition,
             "--modality", modality,
-            "--outdir", str(OUTPUT_DIR),
+            "--outdir", str(run_dir),
             "--method", method,
             "--min_valid_pct", str(min_valid_pct),
             "--save", str(int(save)),
             "--thesis_root", str(THESIS_ROOT),
         ]
+
+        t0 = time.time()
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout_sec))
         if proc.returncode != 0:
             return JSONResponse(
@@ -367,12 +430,50 @@ async def upload_video(
                 },
             )
 
-        out["trusted"] = 0
-        out["hr_bpm"] = None
-        out["spo2_trusted"] = 0
-        out["spo2_pct"] = None
+        summary_csv = _find_summary_csv(run_dir)
+        if summary_csv is None or not summary_csv.exists():
+            out["error"] = "no_summary_csv_generated"
+            out["pipeline"] = {
+                "run_dir": str(run_dir),
+                "runtime_sec": round(time.time() - t0, 2),
+            }
+        else:
+            res = _read_first_row_csv(summary_csv)
+            if not res:
+                out["error"] = "summary_csv_empty"
+                out["pipeline"] = {
+                    "run_dir": str(run_dir),
+                    "summary_csv": str(summary_csv),
+                    "runtime_sec": round(time.time() - t0, 2),
+                }
+            else:
+                fieldnames, row = res
+                hr_col = _pick_hr_column(fieldnames)
+                spo2_col = _pick_spo2_column(fieldnames)
 
-    # Always write a small CSV + download URL
+                hr_val = _to_float(row.get(hr_col)) if hr_col else None
+                spo2_val = _to_float(row.get(spo2_col)) if spo2_col else None
+
+                out["hr_bpm"] = hr_val
+                out["trusted"] = 1 if hr_val is not None else 0
+
+                out["spo2_pct"] = spo2_val
+                out["spo2_trusted"] = 1 if (spo2_val is not None and 70.0 <= float(spo2_val) <= 100.5) else 0
+
+                out["spo2"] = {
+                    "file": str(summary_csv),
+                    "spo2_pct": spo2_val,
+                }
+
+                out["pipeline"] = {
+                    "run_dir": str(run_dir),
+                    "summary_csv": str(summary_csv),
+                    "runtime_sec": round(time.time() - t0, 2),
+                    "hr_col": hr_col,
+                    "spo2_col": spo2_col,
+                }
+
+    # Always write a small CSV and give a download URL
     csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
