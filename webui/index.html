@@ -15,7 +15,7 @@
     .ok { color: #0a7; font-weight: 600; }
     .bad { color: #c20; font-weight: 600; }
     pre { white-space: pre-wrap; word-break: break-word; background: #f6f6f6; padding: 12px; border-radius: 12px; }
-    .hrBig { font-size: 28px; font-weight: 700; }
+    .big { font-size: 28px; font-weight: 700; }
     .pillBtn { background:#fff; color:#111; border:1px solid #111; }
     a { color: #0a58ca; }
     .divider { height: 1px; background: #eee; margin: 12px 0; }
@@ -93,11 +93,9 @@
 
 <script>
 function defaultApiBase() {
-  // If served from http/https (Render), use same origin (no CORS issues).
   if (window.location.protocol === "http:" || window.location.protocol === "https:") {
     return window.location.origin;
   }
-  // If opened as local file://, fallback to your Render URL.
   return "https://rppg-server-pack.onrender.com";
 }
 
@@ -154,7 +152,7 @@ async function run() {
     fd.append("save", "1");
     fd.append("timeout_sec", "240");
 
-    const res = await fetch(`${apiBase}/upload_video`, { method: "POST", body: fd });
+    const res = await fetch(`${apiBase}/upload_video`, { method: "POST", body: fd, cache: "no-store" });
     const data = await res.json();
 
     document.getElementById("resultCard").style.display = "block";
@@ -183,20 +181,19 @@ async function run() {
       </div>
 
       <div class="row" style="margin-top:10px;">
-        <div class="hrBig">HR: ${hrText} bpm</div>
+        <div class="big">HR: ${hrText} bpm</div>
         <div style="font-size:18px;"><b>HR Quality:</b> ${hrQuality}</div>
       </div>
 
       <div class="row" style="margin-top:6px;">
-        <div class="hrBig">SpO₂: ${spo2Text} %</div>
+        <div class="big">SpO₂: ${spo2Text} %</div>
         <div style="font-size:18px;"><b>SpO₂ Quality:</b> ${spo2Quality}</div>
       </div>
 
       ${(!trusted ? `<p class="bad">Low HR signal quality. Try more light, less motion, and keep ROI steady.</p>` : ``)}
-      ${(!spo2Trusted ? `<p class="bad">Low SpO₂ trend quality. Try stable lighting + reduce motion.</p>` : ``)}
+      ${(!spo2Trusted ? `<p class="bad">Low SpO₂ quality. Try more stable lighting and reduce motion.</p>` : ``)}
     `;
 
-    // Download link (show whenever server gives URL)
     const link = document.getElementById("downloadLink");
     const url = data?.saved?.download_url;
     if (url) {
@@ -211,7 +208,7 @@ async function run() {
   } catch (e) {
     console.error(e);
     status.textContent = "Error. Check console.";
-    alert("Request failed. If Render is sleeping, retry in 30–60 seconds.");
+    alert("Request failed. If Render is sleeping, retry.");
   } finally {
     btn.disabled = false;
   }
