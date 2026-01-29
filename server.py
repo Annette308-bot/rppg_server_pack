@@ -60,7 +60,6 @@ def ui():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    # --- SpO2 debug: list available precomputed SpO2 trend CSVs ---
     spo2_files = []
     if THESIS_SPO2_DIR.exists():
         spo2_files = sorted([p.name for p in THESIS_SPO2_DIR.glob("*_spo2_trend.csv")])
@@ -70,17 +69,14 @@ def healthz():
         "version": APP_VERSION,
         "cwd": str(pathlib.Path.cwd()),
         "__file__": str(pathlib.Path(__file__).resolve()),
-
         "ui_index": str(INDEX_HTML),
         "ui_exists": INDEX_HTML.exists(),
-
         "thesis_hr_csv": str(THESIS_HR_CSV),
         "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
-
         "thesis_spo2_dir": str(THESIS_SPO2_DIR),
         "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
 
-        # NEW debug fields
+        # NEW debug
         "spo2_files_count": len(spo2_files),
         "spo2_files_sample": spo2_files[:10],
     }
