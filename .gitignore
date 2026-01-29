@@ -19,3 +19,4 @@ Thumbs.db
 .idea/
 # allow thesis precomputed CSVs to be committed
 !thesis_pipeline/**/*.csv
+status
