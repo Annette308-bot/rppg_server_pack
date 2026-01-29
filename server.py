@@ -8,7 +8,7 @@ import uuid
 import pathlib
 import subprocess
 
-APP_VERSION = "0.1.6"  # HR + SpO2 precomputed support + serve UI at /
+APP_VERSION = "0.1.7"  # Serve UI at /, HR+SpO2 precomputed, healthz lists spo2 files
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 WEBUI_DIR = BASE_DIR / "webui"
@@ -83,8 +83,6 @@ def healthz():
         "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
         "thesis_spo2_dir": str(THESIS_SPO2_DIR),
         "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
-
-        # NEW debug
         "spo2_files_count": len(spo2_files),
         "spo2_files_sample": spo2_files[:10],
     }
@@ -95,7 +93,12 @@ def download_file(name: str):
     path = DOWNLOAD_DIR / name
     if not path.exists():
         return JSONResponse(status_code=404, content={"ok": 0, "error": "file_not_found"})
-    return FileResponse(str(path), media_type="text/csv", filename=name)
+    return FileResponse(
+        str(path),
+        media_type="text/csv",
+        filename=name,
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 def _to_float(x):
@@ -182,7 +185,7 @@ def _pick_spo2_column(fieldnames):
     if not fieldnames:
         return None
     lowered = [c.lower() for c in fieldnames]
-    candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value"]
+    candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value", "spo2_index"]
     for cand in candidates:
         for i, col in enumerate(lowered):
             if col == cand:
@@ -195,7 +198,7 @@ def _pick_spo2_column(fieldnames):
 
 def thesis_spo2_lookup(stem: str):
     """
-    Read SpO2 from per-clip trend file:
+    Read SpO2 from:
       thesis_pipeline/06_spo2/{stem}_spo2_trend.csv
     Return a single summary value (median) + basic stats.
     """
@@ -302,7 +305,7 @@ async def upload_video(
         "spo2_method": method,
         "min_valid_pct": float(min_valid_pct),
 
-        "trusted": 1,
+        "trusted": 1,          # HR trust
         "hr_bpm": None,
         "thesis": None,
 
@@ -342,6 +345,7 @@ async def upload_video(
                 out["spo2_trusted"] = 1
 
     else:
+        # Real pipeline mode (future)
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
@@ -367,11 +371,13 @@ async def upload_video(
                     "cmd": cmd,
                 },
             )
+
         out["trusted"] = 0
         out["hr_bpm"] = None
         out["spo2_trusted"] = 0
         out["spo2_pct"] = None
 
+    # Always write CSV + download URL
     csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
