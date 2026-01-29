@@ -1,242 +1,227 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>rPPG Demo</title>
   <style>
-    body { font-family: system-ui, Arial; max-width: 760px; margin: 28px auto; padding: 0 16px; }
-    .card { border: 1px solid #ddd; border-radius: 14px; padding: 16px; margin: 14px 0; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-    button { padding: 10px 14px; border-radius: 12px; border: 1px solid #111; background: #111; color: #fff; cursor: pointer; }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    input, select { padding: 10px; border-radius: 12px; border: 1px solid #ccc; }
-    .muted { color: #666; font-size: 0.95em; }
-    .ok { color: #0a7; font-weight: 600; }
-    .bad { color: #c20; font-weight: 600; }
-    pre { white-space: pre-wrap; word-break: break-word; background: #f6f6f6; padding: 12px; border-radius: 12px; }
-    .big { font-size: 26px; font-weight: 800; }
-    .pillBtn { background:#fff; color:#111; border:1px solid #111; }
-    a { color: #0a58ca; }
-    .divider { height: 1px; background: #eee; margin: 12px 0; }
-    .hide { display:none; }
+    body { font-family: Arial, sans-serif; background:#fff; color:#111; }
+    .wrap { max-width: 920px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 28px; margin: 0 0 8px; text-align:center; }
+    .sub { text-align:center; color:#444; margin-bottom: 24px; }
+    .card { border: 1px solid #ddd; border-radius: 18px; padding: 22px; margin: 14px 0; }
+    .row { display:flex; gap:14px; flex-wrap:wrap; align-items:center; margin: 12px 0; }
+    label { font-size: 13px; color:#333; display:block; margin-bottom:6px; }
+    input, select { padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; font-size: 14px; }
+    input[type="file"]{ padding: 8px; }
+    .btn { background:#111; color:#fff; border:none; padding: 12px 18px; border-radius: 14px; cursor:pointer; font-weight:600; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .pill { display:inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+    .ok { color:#0a7; font-weight:700; }
+    .bad { color:#b00; font-weight:700; }
+    .muted { color:#666; font-size: 13px; }
+    .big { font-size: 34px; font-weight: 800; margin: 6px 0; }
+    .link { color:#06c; text-decoration: underline; cursor:pointer; }
+    .details { display:none; white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding: 12px; border-radius: 12px; margin-top: 10px; font-size: 13px; }
+    .right { margin-left:auto; }
   </style>
 </head>
 <body>
-  <h2>rPPG Demo</h2>
-  <p class="muted">Upload a face/palm video -> Analyze -> get HR + SpO2 and download CSV.</p>
+<div class="wrap">
+  <h1>rPPG Demo</h1>
+  <div class="sub">Upload a face/palm video → Analyze → get HR + SpO₂ and download CSV.</div>
 
   <div class="card">
-    <div class="row" style="justify-content: space-between;">
-      <div class="muted">Simple mode</div>
-      <button id="settingsBtn" type="button" class="pillBtn" onclick="toggleSettings()">Settings</button>
-    </div>
-
-    <div id="settings" style="display:none; margin-top:12px;">
-      <div class="row">
-        <label>API URL:</label>
-        <input id="apiBase" style="flex:1; min-width: 260px;" />
+    <div class="row">
+      <div style="min-width:280px;">
+        <label>Method</label>
+        <select id="method">
+          <option value="thesis_precomputed">Thesis (precomputed)</option>
+          <option value="fft">Real pipeline (run on upload)</option>
+        </select>
       </div>
-      <p class="muted" style="margin:8px 0 0;">(Auto-filled. Change only if you use another server.)</p>
-      <div class="divider"></div>
+      <div class="muted" id="methodHint" style="flex:1;">
+        Uses thesis CSVs by Subject/Condition/Modality (no upload required).
+      </div>
+      <button class="btn right" type="button" id="settingsBtn">Settings</button>
     </div>
 
-    <div class="row" style="margin-top:12px;">
-      <label>Method:</label>
-      <select id="method" onchange="onMethodChange()">
-        <option value="thesis_precomputed">Thesis (precomputed)</option>
-        <option value="fft">Real pipeline (FFT)</option>
-      </select>
-      <span class="muted" id="methodHint"></span>
+    <div class="row" id="fileRow">
+      <div style="min-width:320px;">
+        <label>Video</label>
+        <input id="video" type="file" accept=".mp4,.mov,.avi,.mkv,.webm"/>
+      </div>
+      <div class="muted">
+        For <b>Real pipeline</b>, video is required. For <b>Thesis</b>, video is ignored.
+      </div>
     </div>
 
-    <div class="row" style="margin-top:12px;">
-      <label>Video:</label>
-      <input id="file" type="file" accept="video/*" />
-    </div>
-
-    <!-- Thesis-only controls -->
-    <div id="thesisControls" style="margin-top:12px;">
-      <div class="row">
-        <label>Subject:</label>
-        <input id="subject" value="S01" style="width:120px;" />
-
-        <label>Condition:</label>
+    <div class="row">
+      <div>
+        <label>Subject</label>
+        <input id="subject" value="S01" style="width:120px;">
+      </div>
+      <div>
+        <label>Condition</label>
         <select id="condition">
           <option value="rest">rest</option>
           <option value="breath">breath</option>
           <option value="exercise">exercise</option>
         </select>
-
-        <label>Modality:</label>
+      </div>
+      <div>
+        <label>Modality</label>
         <select id="modality">
-          <option value="palm">palm</option>
           <option value="face">face</option>
+          <option value="palm">palm</option>
         </select>
-
-        <label>Min valid %:</label>
-        <input id="minValid" type="number" value="50" style="width:90px;" />
+      </div>
+      <div>
+        <label>Min valid %</label>
+        <input id="minvalid" value="50" style="width:90px;">
       </div>
     </div>
 
-    <div class="row" style="margin-top:14px;">
-      <button id="btn" onclick="run()">Analyze</button>
-      <span id="status" class="muted"></span>
+    <div class="row">
+      <button class="btn" id="analyzeBtn" type="button">Analyze</button>
+      <div id="status" class="muted"></div>
     </div>
   </div>
 
   <div class="card" id="resultCard" style="display:none;">
-    <h3>Result</h3>
-    <div id="summary"></div>
+    <div class="muted">Result</div>
+    <div id="stem" class="muted" style="margin-top:6px;"></div>
 
-    <div class="row" style="margin-top:10px; gap:16px;">
-      <a id="downloadLink" href="#" style="display:none;" download>Download CSV</a>
-      <button id="toggleBtn" type="button" class="pillBtn" onclick="toggleDetails()" style="display:none;">
-        Show details
-      </button>
+    <div class="big" id="hrLine">HR: —</div>
+    <div class="muted" id="hrQuality"></div>
+
+    <div class="big" id="spo2Line">SpO₂: —</div>
+    <div class="muted" id="spo2Quality"></div>
+
+    <div class="row" style="margin-top:14px;">
+      <a id="downloadLink" class="link" href="#" target="_blank" rel="noopener">Download CSV</a>
+      <button class="btn" id="toggleBtn" type="button" style="background:#fff;color:#111;border:1px solid #ccc;">Show details</button>
     </div>
 
-    <div id="details" style="display:none; margin-top:12px;">
-      <h4>Details (raw response)</h4>
-      <pre id="raw"></pre>
+    <div class="details" id="details"></div>
+    <div class="muted" style="margin-top:12px;">
+      Note: On Render free tier, the service may sleep; first request can take ~30–60s.
     </div>
-
-    <p class="muted">Note: On Render free tier, the service may sleep; first request can take ~30-60s.</p>
   </div>
+</div>
 
 <script>
-function defaultApiBase() {
-  if (window.location.protocol === "http:" || window.location.protocol === "https:") return window.location.origin;
-  return "https://rppg-server-pack-option-b.onrender.com";
-}
+  const methodEl = document.getElementById("method");
+  const methodHint = document.getElementById("methodHint");
+  const fileRow = document.getElementById("fileRow");
+  const videoEl = document.getElementById("video");
+  const analyzeBtn = document.getElementById("analyzeBtn");
+  const statusEl = document.getElementById("status");
 
-(function init() {
-  const apiEl = document.getElementById("apiBase");
-  if (apiEl) apiEl.value = defaultApiBase();
-  onMethodChange();
-})();
+  const resultCard = document.getElementById("resultCard");
+  const stemEl = document.getElementById("stem");
+  const hrLine = document.getElementById("hrLine");
+  const spo2Line = document.getElementById("spo2Line");
+  const hrQuality = document.getElementById("hrQuality");
+  const spo2Quality = document.getElementById("spo2Quality");
+  const detailsEl = document.getElementById("details");
+  const toggleBtn = document.getElementById("toggleBtn");
+  const downloadLink = document.getElementById("downloadLink");
 
-function toggleSettings() {
-  const s = document.getElementById("settings");
-  const btn = document.getElementById("settingsBtn");
-  const open = s.style.display !== "none";
-  s.style.display = open ? "none" : "block";
-  btn.textContent = open ? "Settings" : "Hide settings";
-}
-
-function toggleDetails() {
-  const details = document.getElementById("details");
-  const btn = document.getElementById("toggleBtn");
-  const isOpen = details.style.display !== "none";
-  details.style.display = isOpen ? "none" : "block";
-  btn.textContent = isOpen ? "Show details" : "Hide details";
-}
-
-function onMethodChange() {
-  const method = document.getElementById("method").value;
-  const thesisControls = document.getElementById("thesisControls");
-  const hint = document.getElementById("methodHint");
-  if (method === "thesis_precomputed") {
-    thesisControls.style.display = "block";
-    hint.textContent = "(uses thesis CSVs by Subject/Condition/Modality)";
-  } else {
-    thesisControls.style.display = "none";
-    hint.textContent = "(runs real pipeline on the uploaded video)";
-  }
-}
-
-async function run() {
-  const apiBaseEl = document.getElementById("apiBase");
-  const apiBase = (apiBaseEl ? apiBaseEl.value : defaultApiBase()).replace(/\/+$/,"");
-
-  const fileInput = document.getElementById("file");
-  const btn = document.getElementById("btn");
-  const status = document.getElementById("status");
-
-  const method = document.getElementById("method").value;
-
-  const subject = document.getElementById("subject")?.value || "S01";
-  const condition = document.getElementById("condition")?.value || "rest";
-  const modality = document.getElementById("modality")?.value || "palm";
-  const minValid = document.getElementById("minValid")?.value || "50";
-
-  if (!fileInput.files || fileInput.files.length === 0) {
-    alert("Please choose a video file first.");
-    return;
-  }
-
-  btn.disabled = true;
-  status.textContent = "Uploading & analyzing...";
-
-  try {
-    const fd = new FormData();
-    fd.append("file", fileInput.files[0]);
-    fd.append("method", method);
-    fd.append("save", "1");
-    fd.append("timeout_sec", "240");
-
-    // Only send thesis fields when method is thesis_precomputed
-    if (method === "thesis_precomputed") {
-      fd.append("subject_id", subject);
-      fd.append("condition", condition);
-      fd.append("modality", modality);
-      fd.append("min_valid_pct", minValid);
-    }
-
-    const res = await fetch(`${apiBase}/upload_video`, { method: "POST", body: fd });
-    const data = await res.json();
-
-    document.getElementById("resultCard").style.display = "block";
-
-    document.getElementById("details").style.display = "none";
-    const toggleBtn = document.getElementById("toggleBtn");
-    toggleBtn.style.display = "inline-block";
-    toggleBtn.textContent = "Show details";
-    document.getElementById("raw").textContent = JSON.stringify(data, null, 2);
-
-    const hr = data.hr_bpm;
-    const trusted = data.trusted;
-    const hrQuality = trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
-    const hrText = (hr === null || hr === undefined) ? "-" : Number(hr).toFixed(1);
-
-    const spo2 = data.spo2_pct;
-    const spo2Trusted = data.spo2_trusted;
-    const spo2Quality = (spo2Trusted === true) ? `<span class="ok">Good</span>` :
-                        (spo2Trusted === false) ? `<span class="bad">Low</span>` : `<span class="muted">-</span>`;
-    const spo2Text = (spo2 === null || spo2 === undefined) ? "-" : Number(spo2).toFixed(1);
-
-    document.getElementById("summary").innerHTML = `
-      <div class="row"><div><b>Stem:</b> ${data.stem || ""}</div></div>
-      <div class="row" style="margin-top:10px;">
-        <div class="big">HR: ${hrText} bpm</div>
-        <div style="font-size:18px;"><b>HR Quality:</b> ${hrQuality}</div>
-      </div>
-      <div class="row" style="margin-top:6px;">
-        <div class="big">SpO2: ${spo2Text} %</div>
-        <div style="font-size:18px;"><b>SpO2 Quality:</b> ${spo2Quality}</div>
-      </div>
-      ${(!trusted ? `<p class="bad">Low signal quality. Try more light, less motion, and keep ROI steady.</p>` : ``)}
-    `;
-
-    const link = document.getElementById("downloadLink");
-    const url = data?.saved?.download_url;
-    if (url && hr !== null && hr !== undefined) {
-      link.href = url;
-      link.style.display = "inline-block";
-      link.textContent = "Download CSV";
+  function setHint() {
+    const m = methodEl.value;
+    if (m === "thesis_precomputed") {
+      methodHint.textContent = "Uses thesis CSVs by Subject/Condition/Modality (no upload required).";
+      // keep file visible but optional
     } else {
-      link.style.display = "none";
+      methodHint.textContent = "Runs the real pipeline script on the uploaded video (upload is required).";
+    }
+  }
+
+  methodEl.addEventListener("change", setHint);
+  setHint();
+
+  toggleBtn.addEventListener("click", () => {
+    const open = detailsEl.style.display === "block";
+    detailsEl.style.display = open ? "none" : "block";
+    toggleBtn.textContent = open ? "Show details" : "Hide details";
+  });
+
+  function fmt(x, digits=1) {
+    if (x === null || x === undefined || Number.isNaN(x)) return "—";
+    return Number(x).toFixed(digits);
+  }
+
+  async function run() {
+    statusEl.textContent = "Working…";
+    analyzeBtn.disabled = true;
+    resultCard.style.display = "none";
+    detailsEl.style.display = "none";
+    toggleBtn.textContent = "Show details";
+
+    const subject = document.getElementById("subject").value.trim() || "S01";
+    const condition = document.getElementById("condition").value;
+    const modality = document.getElementById("modality").value;
+    const minvalid = document.getElementById("minvalid").value.trim() || "50";
+    const method = methodEl.value;
+
+    const fd = new FormData();
+    fd.append("subject_id", subject);
+    fd.append("condition", condition);
+    fd.append("modality", modality);
+    fd.append("method", method);
+    fd.append("min_valid_pct", minvalid);
+
+    // Only attach file for real pipeline
+    if (method !== "thesis_precomputed") {
+      if (!videoEl.files || videoEl.files.length === 0) {
+        statusEl.textContent = "Please choose a video file for Real pipeline.";
+        analyzeBtn.disabled = false;
+        return;
+      }
+      fd.append("file", videoEl.files[0]);
     }
 
-    status.textContent = "Done.";
-  } catch (e) {
-    console.error(e);
-    status.textContent = "Error. Check console.";
-    alert("Request failed. If Render is sleeping, retry in 30-60 seconds.");
-  } finally {
-    btn.disabled = false;
+    try {
+      const res = await fetch(`/upload_video`, { method: "POST", body: fd });
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        statusEl.textContent = "Error: " + (data.error || ("HTTP " + res.status));
+        analyzeBtn.disabled = false;
+        return;
+      }
+
+      // Render results
+      const stem = data.stem || `${subject}_${condition}_${modality}`;
+      stemEl.textContent = `Stem: ${stem}`;
+
+      const hr = data.hr_bpm;
+      const trusted = data.trusted;
+      const spo2 = data.spo2_pct;
+      const spo2Trusted = data.spo2_trusted;
+
+      hrLine.textContent = `HR: ${fmt(hr, 1)} bpm`;
+      hrQuality.innerHTML = `HR Quality: ${trusted ? '<span class="ok">Good</span>' : '<span class="bad">Low</span>'}`;
+
+      spo2Line.textContent = `SpO₂: ${fmt(spo2, 1)} %`;
+      spo2Quality.innerHTML = `SpO₂ Quality: ${spo2Trusted ? '<span class="ok">Good</span>' : '<span class="bad">Low</span>'}`;
+
+      // download
+      const dl = data.saved && data.saved.download_url ? data.saved.download_url : "#";
+      downloadLink.href = dl;
+
+      detailsEl.textContent = JSON.stringify(data, null, 2);
+      resultCard.style.display = "block";
+      statusEl.textContent = "Done.";
+    } catch (e) {
+      statusEl.textContent = "Error: " + e;
+    } finally {
+      analyzeBtn.disabled = false;
+    }
   }
-}
+
+  analyzeBtn.addEventListener("click", run);
 </script>
 </body>
 </html>
