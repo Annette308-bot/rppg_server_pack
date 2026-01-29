@@ -8,7 +8,7 @@ import uuid
 import pathlib
 import subprocess
 
-APP_VERSION = "0.1.7"  # Serve UI at /, HR+SpO2 precomputed, healthz lists spo2 files
+APP_VERSION = "0.1.7"  # HR + SpO2 precomputed + UI no-cache + health debug listing
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 WEBUI_DIR = BASE_DIR / "webui"
@@ -93,12 +93,7 @@ def download_file(name: str):
     path = DOWNLOAD_DIR / name
     if not path.exists():
         return JSONResponse(status_code=404, content={"ok": 0, "error": "file_not_found"})
-    return FileResponse(
-        str(path),
-        media_type="text/csv",
-        filename=name,
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
+    return FileResponse(str(path), media_type="text/csv", filename=name)
 
 
 def _to_float(x):
@@ -198,7 +193,7 @@ def _pick_spo2_column(fieldnames):
 
 def thesis_spo2_lookup(stem: str):
     """
-    Read SpO2 from:
+    Read SpO2 from per-clip trend file:
       thesis_pipeline/06_spo2/{stem}_spo2_trend.csv
     Return a single summary value (median) + basic stats.
     """
@@ -247,7 +242,7 @@ def thesis_spo2_lookup(stem: str):
     return {
         "stem": stem,
         "file": str(path),
-        "spo2_pct": med,
+        "spo2_pct": med,  # main value we expose
         "mean_pct": mean,
         "min_pct": mn,
         "max_pct": mx,
@@ -305,7 +300,7 @@ async def upload_video(
         "spo2_method": method,
         "min_valid_pct": float(min_valid_pct),
 
-        "trusted": 1,          # HR trust
+        "trusted": 1,   # HR trust
         "hr_bpm": None,
         "thesis": None,
 
@@ -345,7 +340,7 @@ async def upload_video(
                 out["spo2_trusted"] = 1
 
     else:
-        # Real pipeline mode (future)
+        # Future: run real pipeline
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
@@ -377,7 +372,7 @@ async def upload_video(
         out["spo2_trusted"] = 0
         out["spo2_pct"] = None
 
-    # Always write CSV + download URL
+    # Always write a small CSV + download URL
     csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
