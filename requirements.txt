@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
 python-multipart
+
 numpy
 pandas
 scipy
+matplotlib
 opencv-python-headless
