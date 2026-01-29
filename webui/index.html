@@ -23,7 +23,7 @@
 </head>
 <body>
   <h2>rPPG Demo (Thesis Precomputed)</h2>
-  <p class="muted">Upload a face/palm video → Analyze → get HR + download CSV.</p>
+  <p class="muted">Upload a face/palm video → Analyze → get HR + SpO₂ + download CSV.</p>
 
   <div class="card">
     <div class="row" style="justify-content: space-between;">
@@ -165,25 +165,41 @@ async function run() {
     toggleBtn.textContent = "Show details";
     document.getElementById("raw").textContent = JSON.stringify(data, null, 2);
 
+    // HR
     const hr = data.hr_bpm;
     const trusted = data.trusted;
-    const quality = trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
+    const hrQuality = trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
     const hrText = (hr === null || hr === undefined) ? "—" : Number(hr).toFixed(1);
+
+    // SpO2
+    const spo2 = data.spo2_pct;
+    const spo2Trusted = data.spo2_trusted;
+    const spo2Quality = spo2Trusted ? `<span class="ok">Good</span>` : `<span class="bad">Low</span>`;
+    const spo2Text = (spo2 === null || spo2 === undefined) ? "—" : Number(spo2).toFixed(1);
 
     document.getElementById("summary").innerHTML = `
       <div class="row">
         <div><b>Stem:</b> ${data.stem || ""}</div>
       </div>
+
       <div class="row" style="margin-top:10px;">
         <div class="hrBig">HR: ${hrText} bpm</div>
-        <div style="font-size:18px;"><b>Quality:</b> ${quality}</div>
+        <div style="font-size:18px;"><b>HR Quality:</b> ${hrQuality}</div>
       </div>
-      ${(!trusted ? `<p class="bad">Low signal quality. Try more light, less motion, and keep ROI steady.</p>` : ``)}
+
+      <div class="row" style="margin-top:6px;">
+        <div class="hrBig">SpO₂: ${spo2Text} %</div>
+        <div style="font-size:18px;"><b>SpO₂ Quality:</b> ${spo2Quality}</div>
+      </div>
+
+      ${(!trusted ? `<p class="bad">Low HR signal quality. Try more light, less motion, and keep ROI steady.</p>` : ``)}
+      ${(!spo2Trusted ? `<p class="bad">Low SpO₂ trend quality. Try stable lighting + reduce motion.</p>` : ``)}
     `;
 
+    // Download link (show whenever server gives URL)
     const link = document.getElementById("downloadLink");
     const url = data?.saved?.download_url;
-    if (url && trusted && hr !== null && hr !== undefined) {
+    if (url) {
       link.href = url;
       link.style.display = "inline-block";
       link.textContent = "Download CSV";
