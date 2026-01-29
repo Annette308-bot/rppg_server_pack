@@ -60,17 +60,29 @@ def ui():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
+    # --- SpO2 debug: list available precomputed SpO2 trend CSVs ---
+    spo2_files = []
+    if THESIS_SPO2_DIR.exists():
+        spo2_files = sorted([p.name for p in THESIS_SPO2_DIR.glob("*_spo2_trend.csv")])
+
     return {
         "ok": True,
         "version": APP_VERSION,
         "cwd": str(pathlib.Path.cwd()),
         "__file__": str(pathlib.Path(__file__).resolve()),
+
         "ui_index": str(INDEX_HTML),
         "ui_exists": INDEX_HTML.exists(),
+
         "thesis_hr_csv": str(THESIS_HR_CSV),
         "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
+
         "thesis_spo2_dir": str(THESIS_SPO2_DIR),
         "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
+
+        # NEW debug fields
+        "spo2_files_count": len(spo2_files),
+        "spo2_files_sample": spo2_files[:10],
     }
 
 
@@ -166,13 +178,11 @@ def _pick_spo2_column(fieldnames):
     if not fieldnames:
         return None
     lowered = [c.lower() for c in fieldnames]
-    # strong candidates first
     candidates = ["spo2", "spo2_pct", "spo2_percent", "spo2_trend", "spo2_est", "spo2_value"]
     for cand in candidates:
         for i, col in enumerate(lowered):
             if col == cand:
                 return fieldnames[i]
-    # fallback: anything containing "spo2"
     for i, col in enumerate(lowered):
         if "spo2" in col:
             return fieldnames[i]
@@ -230,7 +240,7 @@ def thesis_spo2_lookup(stem: str):
     return {
         "stem": stem,
         "file": str(path),
-        "spo2_pct": med,      # main value we expose
+        "spo2_pct": med,
         "mean_pct": mean,
         "min_pct": mn,
         "max_pct": mx,
@@ -285,10 +295,10 @@ async def upload_video(
         "modality": modality,
         "stem": stem,
         "hr_method": method,
-        "spo2_method": method,          # for now same mode
+        "spo2_method": method,
         "min_valid_pct": float(min_valid_pct),
 
-        "trusted": 1,                   # HR trust (backward compatible)
+        "trusted": 1,
         "hr_bpm": None,
         "thesis": None,
 
@@ -322,14 +332,12 @@ async def upload_video(
             out["spo2"] = spo2_row
             out["spo2_pct"] = spo2_row.get("spo2_pct")
 
-            # simple trust rule (you can tighten later)
             n = spo2_row.get("n") or 0
             s = spo2_row.get("spo2_pct")
             if (s is not None) and (n >= 5) and (70.0 <= float(s) <= 100.5):
                 out["spo2_trusted"] = 1
 
     else:
-        # Run real pipeline (future use)
         cmd = [
             sys.executable, str(SCRIPT_PATH),
             "--video", str(dst_path),
@@ -360,7 +368,6 @@ async def upload_video(
         out["spo2_trusted"] = 0
         out["spo2_pct"] = None
 
-    # Always write a small CSV and give a download URL
     csv_name = f"{stem}_{uuid.uuid4().hex}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
