@@ -47,14 +47,22 @@ ALLOWED_METHODS = {"thesis_precomputed", "fft"}  # extend later
 @app.get("/", include_in_schema=False)
 def root():
     if INDEX_HTML.exists():
-        return FileResponse(str(INDEX_HTML), media_type="text/html")
+        return FileResponse(
+            str(INDEX_HTML),
+            media_type="text/html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
     return RedirectResponse(url="/docs")
 
 
 @app.get("/ui", include_in_schema=False)
 def ui():
     if INDEX_HTML.exists():
-        return FileResponse(str(INDEX_HTML), media_type="text/html")
+        return FileResponse(
+            str(INDEX_HTML),
+            media_type="text/html",
+            headers={"Cache-Control": "no-store, max-age=0"},
+        )
     return RedirectResponse(url="/docs")
 
 
