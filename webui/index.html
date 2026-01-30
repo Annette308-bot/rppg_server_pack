@@ -9,27 +9,35 @@
     .wrap { max-width: 920px; margin: 40px auto; padding: 0 16px; }
     h1 { font-size: 28px; margin: 0 0 8px; text-align:center; }
     .sub { text-align:center; color:#444; margin-bottom: 24px; }
+
     .card { border: 1px solid #ddd; border-radius: 18px; padding: 22px; margin: 14px 0; }
     .row { display:flex; gap:14px; flex-wrap:wrap; align-items:center; margin: 12px 0; }
     label { font-size: 13px; color:#333; display:block; margin-bottom:6px; }
     input, select { padding: 10px 12px; border-radius: 12px; border: 1px solid #ccc; font-size: 14px; }
     input[type="file"]{ padding: 8px; }
+
     .btn { background:#111; color:#fff; border:none; padding: 12px 18px; border-radius: 14px; cursor:pointer; font-weight:600; }
     .btn:disabled { opacity:.5; cursor:not-allowed; }
-    .pill { display:inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; margin-left: 8px; }
+
     .ok { color:#0a7; font-weight:700; }
     .bad { color:#b00; font-weight:700; }
     .muted { color:#666; font-size: 13px; }
     .big { font-size: 34px; font-weight: 800; margin: 6px 0; }
     .link { color:#06c; text-decoration: underline; cursor:pointer; }
+
     .details { display:none; white-space: pre-wrap; background:#fafafa; border:1px solid #eee; padding: 12px; border-radius: 12px; margin-top: 10px; font-size: 13px; }
     .right { margin-left:auto; }
+
+    .hint { color:#555; font-size: 13px; line-height: 1.4; }
+    .modeTag { display:inline-block; margin-left:8px; padding: 2px 10px; border:1px solid #ddd; border-radius:999px; font-size: 12px; color:#333; background:#fafafa; }
+    .fileDisabled { opacity: 0.55; }
+    .warn { color:#b00; font-weight:700; }
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>rPPG Demo</h1>
-  <div class="sub">Upload a face/palm video → Analyze → get HR + SpO₂ and download CSV.</div>
+  <div class="sub">Upload a face/palm video → Analyze → get HR + SpO₂ trend index and download a tiny CSV.</div>
 
   <div class="card">
     <div class="row">
@@ -40,10 +48,10 @@
           <option value="fft">Real pipeline (run on upload)</option>
         </select>
       </div>
-      <div class="muted" id="methodHint" style="flex:1;">
+      <div class="hint" id="methodHint" style="flex:1;">
         Uses thesis CSVs by Subject/Condition/Modality (no upload required).
       </div>
-      <button class="btn right" type="button" id="settingsBtn">Settings</button>
+      <button class="btn right" type="button" id="settingsBtn">API Docs</button>
     </div>
 
     <div class="row" id="fileRow">
@@ -51,7 +59,7 @@
         <label>Video</label>
         <input id="video" type="file" accept=".mp4,.mov,.avi,.mkv,.webm"/>
       </div>
-      <div class="muted">
+      <div class="hint" id="fileHint">
         For <b>Real pipeline</b>, video is required. For <b>Thesis</b>, video is ignored.
       </div>
     </div>
@@ -89,7 +97,10 @@
   </div>
 
   <div class="card" id="resultCard" style="display:none;">
-    <div class="muted">Result</div>
+    <div class="muted">
+      Result
+      <span class="modeTag" id="modeTag">Mode: —</span>
+    </div>
     <div id="stem" class="muted" style="margin-top:6px;"></div>
 
     <div class="big" id="hrLine">HR: —</div>
@@ -99,7 +110,7 @@
     <div class="muted" id="spo2Quality"></div>
 
     <div class="row" style="margin-top:14px;">
-      <a id="downloadLink" class="link" href="#" target="_blank" rel="noopener">Download CSV</a>
+      <a id="downloadLink" class="link" href="#" target="_blank" rel="noopener" style="display:none;">Download CSV</a>
       <button class="btn" id="toggleBtn" type="button" style="background:#fff;color:#111;border:1px solid #ccc;">Show details</button>
     </div>
 
@@ -114,11 +125,13 @@
   const methodEl = document.getElementById("method");
   const methodHint = document.getElementById("methodHint");
   const fileRow = document.getElementById("fileRow");
+  const fileHint = document.getElementById("fileHint");
   const videoEl = document.getElementById("video");
   const analyzeBtn = document.getElementById("analyzeBtn");
   const statusEl = document.getElementById("status");
 
   const resultCard = document.getElementById("resultCard");
+  const modeTag = document.getElementById("modeTag");
   const stemEl = document.getElementById("stem");
   const hrLine = document.getElementById("hrLine");
   const spo2Line = document.getElementById("spo2Line");
@@ -127,19 +140,35 @@
   const detailsEl = document.getElementById("details");
   const toggleBtn = document.getElementById("toggleBtn");
   const downloadLink = document.getElementById("downloadLink");
+  const settingsBtn = document.getElementById("settingsBtn");
 
-  function setHint() {
+  function setUIByMethod() {
     const m = methodEl.value;
+
+    // reset status
+    statusEl.textContent = "";
+
     if (m === "thesis_precomputed") {
       methodHint.textContent = "Uses thesis CSVs by Subject/Condition/Modality (no upload required).";
-      // keep file visible but optional
+      fileHint.innerHTML = "Thesis mode: <b>video is ignored</b> (you can leave it empty).";
+      videoEl.disabled = true;
+      videoEl.classList.add("fileDisabled");
+      fileRow.classList.add("fileDisabled");
     } else {
       methodHint.textContent = "Runs the real pipeline script on the uploaded video (upload is required).";
+      fileHint.innerHTML = "Real pipeline mode: <b>video is required</b>.";
+      videoEl.disabled = false;
+      videoEl.classList.remove("fileDisabled");
+      fileRow.classList.remove("fileDisabled");
     }
   }
 
-  methodEl.addEventListener("change", setHint);
-  setHint();
+  methodEl.addEventListener("change", setUIByMethod);
+  setUIByMethod();
+
+  settingsBtn.addEventListener("click", () => {
+    window.open("/docs", "_blank");
+  });
 
   toggleBtn.addEventListener("click", () => {
     const open = detailsEl.style.display === "block";
@@ -148,22 +177,38 @@
   });
 
   function fmt(x, digits=1) {
-    if (x === null || x === undefined || Number.isNaN(x)) return "—";
+    if (x === null || x === undefined || Number.isNaN(Number(x))) return "—";
     return Number(x).toFixed(digits);
+  }
+
+  function qualBadge(ok) {
+    return ok ? '<span class="ok">Good</span>' : '<span class="bad">Low</span>';
   }
 
   async function run() {
     statusEl.textContent = "Working…";
     analyzeBtn.disabled = true;
+
     resultCard.style.display = "none";
     detailsEl.style.display = "none";
     toggleBtn.textContent = "Show details";
+    downloadLink.style.display = "none";
+    downloadLink.href = "#";
 
-    const subject = document.getElementById("subject").value.trim() || "S01";
+    const subject = (document.getElementById("subject").value || "S01").trim() || "S01";
     const condition = document.getElementById("condition").value;
     const modality = document.getElementById("modality").value;
-    const minvalid = document.getElementById("minvalid").value.trim() || "50";
+    const minvalid = (document.getElementById("minvalid").value || "50").trim() || "50";
     const method = methodEl.value;
+
+    // Real pipeline requires a file
+    if (method !== "thesis_precomputed") {
+      if (!videoEl.files || videoEl.files.length === 0) {
+        statusEl.innerHTML = '<span class="warn">Please choose a video file for Real pipeline.</span>';
+        analyzeBtn.disabled = false;
+        return;
+      }
+    }
 
     const fd = new FormData();
     fd.append("subject_id", subject);
@@ -172,50 +217,60 @@
     fd.append("method", method);
     fd.append("min_valid_pct", minvalid);
 
-    // Only attach file for real pipeline
     if (method !== "thesis_precomputed") {
-      if (!videoEl.files || videoEl.files.length === 0) {
-        statusEl.textContent = "Please choose a video file for Real pipeline.";
-        analyzeBtn.disabled = false;
-        return;
-      }
       fd.append("file", videoEl.files[0]);
     }
 
     try {
-      const res = await fetch(`/upload_video`, { method: "POST", body: fd });
-      const data = await res.json();
+      const res = await fetch("/upload_video", { method: "POST", body: fd });
+      const data = await res.json().catch(() => ({}));
 
       if (!res.ok || !data.ok) {
-        statusEl.textContent = "Error: " + (data.error || ("HTTP " + res.status));
+        const err = data.error || ("HTTP " + res.status);
+        statusEl.innerHTML = '<span class="warn">Error:</span> ' + String(err);
+        detailsEl.textContent = JSON.stringify(data, null, 2);
+        resultCard.style.display = "block";
+        modeTag.textContent = "Mode: " + (method === "thesis_precomputed" ? "Thesis (precomputed)" : "Real pipeline");
+        stemEl.textContent = "Stem: " + (data.stem || `${subject}_${condition}_${modality}`);
+        hrLine.textContent = "HR: —";
+        spo2Line.textContent = "SpO₂: —";
+        hrQuality.textContent = "";
+        spo2Quality.textContent = "";
         analyzeBtn.disabled = false;
         return;
       }
 
-      // Render results
+      // Mode display
+      modeTag.textContent = "Mode: " + (data.method === "thesis_precomputed" ? "Thesis (precomputed)" : "Real pipeline");
+
       const stem = data.stem || `${subject}_${condition}_${modality}`;
       stemEl.textContent = `Stem: ${stem}`;
 
       const hr = data.hr_bpm;
-      const trusted = data.trusted;
+      const trusted = !!data.trusted;
+
       const spo2 = data.spo2_pct;
-      const spo2Trusted = data.spo2_trusted;
+      const spo2Trusted = !!data.spo2_trusted;
 
       hrLine.textContent = `HR: ${fmt(hr, 1)} bpm`;
-      hrQuality.innerHTML = `HR Quality: ${trusted ? '<span class="ok">Good</span>' : '<span class="bad">Low</span>'}`;
+      hrQuality.innerHTML = `HR Quality: ${qualBadge(trusted)}`;
 
+      // SpO2 is a trend index, not clinical SpO2 (but show anyway)
       spo2Line.textContent = `SpO₂: ${fmt(spo2, 1)} %`;
-      spo2Quality.innerHTML = `SpO₂ Quality: ${spo2Trusted ? '<span class="ok">Good</span>' : '<span class="bad">Low</span>'}`;
+      spo2Quality.innerHTML = `SpO₂ Quality: ${qualBadge(spo2Trusted)}`;
 
-      // download
-      const dl = data.saved && data.saved.download_url ? data.saved.download_url : "#";
-      downloadLink.href = dl;
+      // Download URL
+      const dl = data.saved && data.saved.download_url ? data.saved.download_url : null;
+      if (dl) {
+        downloadLink.href = dl;
+        downloadLink.style.display = "inline-block";
+      }
 
       detailsEl.textContent = JSON.stringify(data, null, 2);
       resultCard.style.display = "block";
       statusEl.textContent = "Done.";
     } catch (e) {
-      statusEl.textContent = "Error: " + e;
+      statusEl.innerHTML = '<span class="warn">Error:</span> ' + String(e);
     } finally {
       analyzeBtn.disabled = false;
     }
