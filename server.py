@@ -12,7 +12,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "0.2.2"  # bump when you change behavior
+APP_VERSION = "0.2.2"
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -36,11 +36,7 @@ WEBUI_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_CONDITIONS = {"rest", "breath", "exercise"}
 ALLOWED_MODALITIES = {"face", "palm"}
-
-# Two modes in ONE service:
-# - thesis_precomputed: ignores uploaded file; uses thesis CSVs
-# - fft: runs real pipeline on uploaded video
-ALLOWED_METHODS = {"thesis_precomputed", "fft"}
+ALLOWED_METHODS = {"thesis_precomputed", "fft"}  # thesis_precomputed = no upload, fft = run on upload
 
 
 def _no_cache_headers() -> Dict[str, str]:
@@ -52,21 +48,10 @@ def _to_float(x) -> Optional[float]:
         if x is None:
             return None
         s = str(x).strip()
-        if s == "":
+        if s == "" or s.lower() == "none":
             return None
-        return float(s)
-    except Exception:
-        return None
-
-
-def _to_int(x) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "":
-            return None
-        return int(float(s))
+        v = float(s)
+        return v
     except Exception:
         return None
 
@@ -89,21 +74,6 @@ def _safe_suffix(filename: str) -> str:
     return ".mp4"
 
 
-def _pick_hr_column(fieldnames: List[str]) -> Optional[str]:
-    if not fieldnames:
-        return None
-    lowered = [c.lower() for c in fieldnames]
-    candidates = ["hr_bpm", "hr", "bpm", "median_bpm", "median_hr", "median"]
-    for cand in candidates:
-        for i, col in enumerate(lowered):
-            if col == cand:
-                return fieldnames[i]
-    for i, col in enumerate(lowered):
-        if "hr" in col or "bpm" in col:
-            return fieldnames[i]
-    return None
-
-
 def _pick_spo2_column(fieldnames: List[str]) -> Optional[str]:
     if not fieldnames:
         return None
@@ -119,6 +89,50 @@ def _pick_spo2_column(fieldnames: List[str]) -> Optional[str]:
     return None
 
 
+def _pick_hr_column(fieldnames: List[str]) -> Optional[str]:
+    if not fieldnames:
+        return None
+    lowered = [c.lower() for c in fieldnames]
+    candidates = ["hr_bpm", "hr", "bpm", "median_bpm", "median_hr", "median"]
+    for cand in candidates:
+        for i, col in enumerate(lowered):
+            if col == cand:
+                return fieldnames[i]
+    for i, col in enumerate(lowered):
+        if "hr" in col or "bpm" in col:
+            return fieldnames[i]
+    return None
+
+
+def _parse_metrics_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
+    """
+    Accept either:
+      METRICS_JSON={...}
+    or a raw JSON line {...}
+    We scan from bottom to top.
+    """
+    if not stdout:
+        return None
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if line.startswith("METRICS_JSON="):
+            payload = line.split("=", 1)[1].strip()
+            try:
+                obj = json.loads(payload)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                continue
+    return None
+
+
 def thesis_hr_lookup(stem: str) -> Dict[str, Any]:
     if not THESIS_HR_CSV.exists():
         return {"hr_bpm": None, "valid_pct_masked": None, "selected_imf": None, "error": "thesis_hr_csv_missing"}
@@ -129,25 +143,10 @@ def thesis_hr_lookup(stem: str) -> Dict[str, Any]:
             row_stem = (row.get("stem") or "").strip()
             if row_stem != stem:
                 continue
-
-            hr = (
-                _to_float(row.get("hr_bpm"))
-                or _to_float(row.get("median_bpm"))
-                or _to_float(row.get("Median_Bpm"))
-                or _to_float(row.get("MEDIAN_BPM"))
-            )
-            valid_pct = (
-                _to_float(row.get("valid_pct_masked"))
-                or _to_float(row.get("valid_pct"))
-                or _to_float(row.get("valid_pct_mask"))
-            )
+            hr = _to_float(row.get("hr_bpm")) or _to_float(row.get("median_bpm")) or _to_float(row.get("Median_Bpm")) or _to_float(row.get("MEDIAN_BPM"))
+            valid_pct = _to_float(row.get("valid_pct_masked")) or _to_float(row.get("valid_pct")) or _to_float(row.get("valid_pct_mask"))
             selected_imf = row.get("selected_imf") or row.get("selected_imf_idx") or row.get("imf_selected")
-
-            return {
-                "hr_bpm": hr,
-                "valid_pct_masked": valid_pct,
-                "selected_imf": selected_imf,
-            }
+            return {"hr_bpm": hr, "valid_pct_masked": valid_pct, "selected_imf": selected_imf}
 
     return {"hr_bpm": None, "valid_pct_masked": None, "selected_imf": None, "error": "stem_not_found_in_thesis_hr_csv"}
 
@@ -163,7 +162,6 @@ def thesis_spo2_lookup(stem: str) -> Dict[str, Any]:
         spo2_col = _pick_spo2_column(r.fieldnames or [])
         if spo2_col is None:
             return {"spo2_pct": None, "n": 0, "error": "spo2_column_not_found", "columns": r.fieldnames}
-
         for row in r:
             v = _to_float(row.get(spo2_col))
             if v is not None:
@@ -183,106 +181,8 @@ def thesis_spo2_lookup(stem: str) -> Dict[str, Any]:
     }
 
 
-def _find_summary_csv(run_dir: pathlib.Path) -> Optional[pathlib.Path]:
-    candidates = [
-        run_dir / "summary_metrics.csv",
-        run_dir / "analysis" / "summary_metrics.csv",
-        run_dir / "summary.csv",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-
-    found = list(run_dir.glob("**/*summary*.csv"))
-    if not found:
-        found = list(run_dir.glob("**/*.csv"))
-    if not found:
-        return None
-
-    found.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    return found[0]
-
-
-def _parse_summary_csv(path: pathlib.Path) -> Dict[str, Any]:
-    """
-    Reads first row of summary csv and extracts HR + SpO2 + trusted if present.
-    """
-    with path.open("r", newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        hr_col = _pick_hr_column(r.fieldnames or [])
-        spo2_col = _pick_spo2_column(r.fieldnames or [])
-
-        for row in r:
-            hr = _to_float(row.get(hr_col)) if hr_col else None
-            spo2 = _to_float(row.get(spo2_col)) if spo2_col else None
-
-            valid_pct = (
-                _to_float(row.get("valid_pct_masked"))
-                or _to_float(row.get("valid_pct"))
-                or _to_float(row.get("valid_pct_mask"))
-            )
-
-            trusted = _to_float(row.get("trusted"))
-            spo2_trusted = _to_float(row.get("spo2_trusted"))
-
-            return {
-                "hr_bpm": hr,
-                "spo2_pct": spo2,
-                "valid_pct_masked": valid_pct,
-                "trusted": trusted,
-                "spo2_trusted": spo2_trusted,
-                "hr_col": hr_col,
-                "spo2_col": spo2_col,
-                "file": str(path),
-            }
-
-    return {"hr_bpm": None, "spo2_pct": None, "valid_pct_masked": None, "file": str(path), "error": "empty_summary_csv"}
-
-
-def _parse_metrics_from_stdout(stdout: str, stderr: str = "") -> Optional[Dict[str, Any]]:
-    """
-    Supports:
-      - METRICS_JSON={...}
-      - plain JSON line: {...}
-    """
-    text = (stdout or "").strip()
-    if not text and stderr:
-        text = (stderr or "").strip()
-    if not text:
-        return None
-
-    # Search from bottom (last lines)
-    lines = (stdout or "").splitlines()
-    lines += (stderr or "").splitlines()
-
-    for line in lines[::-1]:
-        s = (line or "").strip()
-        if not s:
-            continue
-
-        if s.startswith("METRICS_JSON="):
-            payload = s.split("=", 1)[1].strip()
-            try:
-                return json.loads(payload)
-            except Exception:
-                continue
-
-        # plain JSON object line
-        if s.startswith("{") and s.endswith("}"):
-            try:
-                return json.loads(s)
-            except Exception:
-                continue
-
-    return None
-
-
 def _render_git_commit() -> Optional[str]:
-    return (
-        os.environ.get("RENDER_GIT_COMMIT")
-        or os.environ.get("GIT_COMMIT")
-        or os.environ.get("COMMIT_SHA")
-    )
+    return os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or os.environ.get("COMMIT_SHA")
 
 
 app = FastAPI(title="rPPG Server", version=APP_VERSION)
@@ -315,7 +215,6 @@ def healthz():
     spo2_files = []
     if THESIS_SPO2_DIR.exists():
         spo2_files = sorted([p.name for p in THESIS_SPO2_DIR.glob("*_spo2_trend.csv")])
-
     return {
         "ok": True,
         "version": APP_VERSION,
@@ -324,9 +223,7 @@ def healthz():
         "__file__": str(pathlib.Path(__file__).resolve()),
         "ui_index": str(INDEX_HTML),
         "ui_exists": INDEX_HTML.exists(),
-        "thesis_hr_csv": str(THESIS_HR_CSV),
         "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
-        "thesis_spo2_dir": str(THESIS_SPO2_DIR),
         "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
         "spo2_files_count": len(spo2_files),
         "spo2_files_sample": spo2_files[:10],
@@ -347,7 +244,7 @@ def download_file(name: str):
 @app.post("/upload_video")
 async def upload_video(
     request: Request,
-    file: Optional[UploadFile] = File(None),  # optional for thesis_precomputed
+    file: Optional[UploadFile] = File(None),
     subject_id: str = Form("S01"),
     condition: str = Form("rest"),
     modality: str = Form("face"),
@@ -390,8 +287,6 @@ async def upload_video(
 
         hr_bpm = hr.get("hr_bpm")
         valid_pct = hr.get("valid_pct_masked")
-
-        # trusted by valid_pct threshold for thesis mode
         trusted = 1 if (valid_pct is not None and valid_pct >= float(min_valid_pct)) else 0
 
         spo2_pct = sp.get("spo2_pct")
@@ -450,18 +345,17 @@ async def upload_video(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
-    timeout_sec = 240  # allow a bit more time for video processing
+    timeout_sec = 180
 
     cmd = [
-        sys.executable,
-        str(SCRIPT_PATH),
+        sys.executable, str(SCRIPT_PATH),
         "--video", str(dst_path),
         "--subject", subject_id,
         "--condition", condition,
         "--modality", modality,
         "--outdir", str(run_dir),
-        "--min_valid_pct", str(float(min_valid_pct)),
         "--method", "fft",
+        "--save", "1",
     ]
 
     try:
@@ -476,92 +370,62 @@ async def upload_video(
                 "ok": 0,
                 "error": "pipeline_failed",
                 "returncode": proc.returncode,
-                "stdout": (proc.stdout or "")[-3000:],
-                "stderr": (proc.stderr or "")[-3000:],
+                "stdout": proc.stdout[-3000:],
+                "stderr": proc.stderr[-3000:],
                 "cmd": cmd,
             },
         )
 
-    summary_csv = _find_summary_csv(run_dir)
+    metrics = _parse_metrics_from_stdout(proc.stdout)
 
-    metrics = None
-    parsed = None
-
-    if summary_csv is not None and summary_csv.exists():
-        parsed = _parse_summary_csv(summary_csv)
-    else:
-        metrics = _parse_metrics_from_stdout(proc.stdout, proc.stderr)
-
-    # If both missing, error
-    if parsed is None and metrics is None:
+    if not metrics or float(metrics.get("ok", 0.0)) != 1.0:
         return JSONResponse(
             status_code=500,
             content={
                 "ok": 0,
-                "error": "summary_csv_not_found",
-                "run_dir": str(run_dir),
-                "stdout": (proc.stdout or "")[-2000:],
-                "stderr": (proc.stderr or "")[-2000:],
+                "error": "metrics_not_found_in_stdout",
+                "stdout": proc.stdout[-2500:],
+                "stderr": proc.stderr[-2500:],
             },
         )
 
-    # Prefer parsed CSV, fallback to metrics JSON
-    hr_bpm = (parsed or {}).get("hr_bpm") if parsed else None
-    spo2_pct = (parsed or {}).get("spo2_pct") if parsed else None
+    hr_bpm = _to_float(metrics.get("hr_bpm"))
+    spo2_pct = _to_float(metrics.get("spo2_pct"))
+    spo2_ratio = _to_float(metrics.get("spo2_ratio_rg"))
 
-    if hr_bpm is None and metrics:
-        hr_bpm = metrics.get("hr_bpm")
-    if spo2_pct is None and metrics:
-        spo2_pct = metrics.get("spo2_pct")
-
-    # TRUST LOGIC (IMPORTANT):
-    # Real pipeline should trust by 'trusted' field if available.
-    trusted = None
-    if parsed and parsed.get("trusted") is not None:
-        trusted = 1 if float(parsed.get("trusted")) >= 0.5 else 0
-    elif metrics and metrics.get("trusted") is not None:
-        trusted = 1 if float(metrics.get("trusted")) >= 0.5 else 0
-    else:
-        # fallback: if HR exists, mark trusted
-        trusted = 1 if hr_bpm is not None else 0
-
-    spo2_trusted = None
-    if parsed and parsed.get("spo2_trusted") is not None:
-        spo2_trusted = 1 if float(parsed.get("spo2_trusted")) >= 0.5 else 0
-    elif metrics and metrics.get("spo2_trusted") is not None:
-        spo2_trusted = 1 if float(metrics.get("spo2_trusted")) >= 0.5 else 0
-    else:
-        spo2_trusted = 1 if spo2_pct is not None else 0
+    trusted = 1 if hr_bpm is not None else 0
+    spo2_trusted = 1 if spo2_pct is not None else 0
 
     out.update(
         {
             "hr_bpm": hr_bpm,
+            "valid_pct_masked": metrics.get("valid_pct_masked"),
             "trusted": trusted,
-            "hr_method": "real_pipeline_fft",
+            "hr_method": "fft_peak",
             "spo2_pct": spo2_pct,
             "spo2_trusted": spo2_trusted,
-            "spo2_method": "real_pipeline_ratio",
+            "spo2_method": "rg_acdc_ratio",
             "details": {
                 "runtime_sec": round(time.time() - t0, 2),
                 "run_dir": str(run_dir),
-                "summary_csv": str(summary_csv) if summary_csv else None,
-                "parsed": parsed,
-                "metrics_from_stdout": metrics,
+                "stdout_tail": proc.stdout[-800:],
+                "spo2_ratio_rg": spo2_ratio,
+                "spo2_error": metrics.get("spo2_error"),
+                "frames": metrics.get("frames"),
+                "fs": metrics.get("fs"),
             },
         }
     )
 
-    # Save a tiny downloadable CSV summary (always)
     csv_name = f"{stem}_real_{run_id}.csv"
     csv_path = DOWNLOAD_DIR / csv_name
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["subject", "condition", "modality", "method", "stem", "hr_bpm", "trusted", "spo2_pct", "spo2_trusted"])
-        w.writerow([subject_id, condition, modality, method, stem, hr_bpm, trusted, spo2_pct, spo2_trusted])
+        w.writerow(["subject", "condition", "modality", "method", "stem", "hr_bpm", "trusted", "spo2_pct", "spo2_trusted", "spo2_ratio_rg"])
+        w.writerow([subject_id, condition, modality, method, stem, hr_bpm, trusted, spo2_pct, spo2_trusted, spo2_ratio])
 
     out["saved"] = {"summary_metrics_csv": str(csv_path), "download_url": f"{base}/downloads/{csv_name}"}
 
-    # optionally delete upload
     if int(save) == 0:
         try:
             dst_path.unlink(missing_ok=True)
