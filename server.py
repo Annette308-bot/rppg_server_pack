@@ -3,16 +3,16 @@ import sys
 import time
 import uuid
 import csv
-import json
 import pathlib
 import subprocess
+import json
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.0"
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
@@ -36,35 +36,13 @@ WEBUI_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_CONDITIONS = {"rest", "breath", "exercise"}
 ALLOWED_MODALITIES = {"face", "palm"}
-ALLOWED_METHODS = {"thesis_precomputed", "fft"}  # thesis_precomputed = no upload, fft = run on upload
+
+# NEW: include ceemdan_hilbert
+ALLOWED_METHODS = {"thesis_precomputed", "fft", "ceemdan_hilbert"}
 
 
 def _no_cache_headers() -> Dict[str, str]:
     return {"Cache-Control": "no-store, max-age=0"}
-
-
-def _to_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        s = str(x).strip()
-        if s == "" or s.lower() == "none":
-            return None
-        v = float(s)
-        return v
-    except Exception:
-        return None
-
-
-def _median(vals: List[float]) -> Optional[float]:
-    vals = sorted([v for v in vals if v is not None])
-    n = len(vals)
-    if n == 0:
-        return None
-    mid = n // 2
-    if n % 2 == 1:
-        return float(vals[mid])
-    return float(vals[mid - 1] + vals[mid]) / 2.0
 
 
 def _safe_suffix(filename: str) -> str:
@@ -74,115 +52,25 @@ def _safe_suffix(filename: str) -> str:
     return ".mp4"
 
 
-def _pick_spo2_column(fieldnames: List[str]) -> Optional[str]:
-    if not fieldnames:
-        return None
-    lowered = [c.lower() for c in fieldnames]
-    candidates = ["spo2_pct", "spo2_percent", "spo2", "spo2_value", "spo2_est"]
-    for cand in candidates:
-        for i, col in enumerate(lowered):
-            if col == cand:
-                return fieldnames[i]
-    for i, col in enumerate(lowered):
-        if "spo2" in col:
-            return fieldnames[i]
-    return None
-
-
-def _pick_hr_column(fieldnames: List[str]) -> Optional[str]:
-    if not fieldnames:
-        return None
-    lowered = [c.lower() for c in fieldnames]
-    candidates = ["hr_bpm", "hr", "bpm", "median_bpm", "median_hr", "median"]
-    for cand in candidates:
-        for i, col in enumerate(lowered):
-            if col == cand:
-                return fieldnames[i]
-    for i, col in enumerate(lowered):
-        if "hr" in col or "bpm" in col:
-            return fieldnames[i]
-    return None
+def _render_git_commit() -> Optional[str]:
+    return (
+        os.environ.get("RENDER_GIT_COMMIT")
+        or os.environ.get("GIT_COMMIT")
+        or os.environ.get("COMMIT_SHA")
+    )
 
 
 def _parse_metrics_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
-    """
-    Accept either:
-      METRICS_JSON={...}
-    or a raw JSON line {...}
-    We scan from bottom to top.
-    """
     if not stdout:
         return None
-    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-    for line in reversed(lines):
+    for line in stdout.splitlines()[::-1]:
+        line = line.strip()
         if line.startswith("METRICS_JSON="):
-            payload = line.split("=", 1)[1].strip()
             try:
-                obj = json.loads(payload)
-                if isinstance(obj, dict):
-                    return obj
+                return json.loads(line.split("=", 1)[1])
             except Exception:
-                continue
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                continue
+                return None
     return None
-
-
-def thesis_hr_lookup(stem: str) -> Dict[str, Any]:
-    if not THESIS_HR_CSV.exists():
-        return {"hr_bpm": None, "valid_pct_masked": None, "selected_imf": None, "error": "thesis_hr_csv_missing"}
-
-    with THESIS_HR_CSV.open("r", newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            row_stem = (row.get("stem") or "").strip()
-            if row_stem != stem:
-                continue
-            hr = _to_float(row.get("hr_bpm")) or _to_float(row.get("median_bpm")) or _to_float(row.get("Median_Bpm")) or _to_float(row.get("MEDIAN_BPM"))
-            valid_pct = _to_float(row.get("valid_pct_masked")) or _to_float(row.get("valid_pct")) or _to_float(row.get("valid_pct_mask"))
-            selected_imf = row.get("selected_imf") or row.get("selected_imf_idx") or row.get("imf_selected")
-            return {"hr_bpm": hr, "valid_pct_masked": valid_pct, "selected_imf": selected_imf}
-
-    return {"hr_bpm": None, "valid_pct_masked": None, "selected_imf": None, "error": "stem_not_found_in_thesis_hr_csv"}
-
-
-def thesis_spo2_lookup(stem: str) -> Dict[str, Any]:
-    path = THESIS_SPO2_DIR / f"{stem}_spo2_trend.csv"
-    if not path.exists():
-        return {"spo2_pct": None, "n": 0, "error": "spo2_trend_missing"}
-
-    values: List[float] = []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        spo2_col = _pick_spo2_column(r.fieldnames or [])
-        if spo2_col is None:
-            return {"spo2_pct": None, "n": 0, "error": "spo2_column_not_found", "columns": r.fieldnames}
-        for row in r:
-            v = _to_float(row.get(spo2_col))
-            if v is not None:
-                values.append(v)
-
-    if not values:
-        return {"spo2_pct": None, "n": 0, "error": "no_numeric_spo2_values"}
-
-    med = _median(values)
-    mean = float(sum(values) / len(values))
-    return {
-        "spo2_pct": med if med is not None else mean,
-        "n": len(values),
-        "min_pct": float(min(values)),
-        "max_pct": float(max(values)),
-        "file": str(path),
-    }
-
-
-def _render_git_commit() -> Optional[str]:
-    return os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or os.environ.get("COMMIT_SHA")
 
 
 app = FastAPI(title="rPPG Server", version=APP_VERSION)
@@ -212,9 +100,6 @@ def ui():
 
 @app.get("/healthz", include_in_schema=False)
 def healthz():
-    spo2_files = []
-    if THESIS_SPO2_DIR.exists():
-        spo2_files = sorted([p.name for p in THESIS_SPO2_DIR.glob("*_spo2_trend.csv")])
     return {
         "ok": True,
         "version": APP_VERSION,
@@ -223,11 +108,11 @@ def healthz():
         "__file__": str(pathlib.Path(__file__).resolve()),
         "ui_index": str(INDEX_HTML),
         "ui_exists": INDEX_HTML.exists(),
+        "script_path": str(SCRIPT_PATH),
+        "script_exists": SCRIPT_PATH.exists(),
+        "allowed_methods": sorted(ALLOWED_METHODS),
         "thesis_hr_csv_exists": THESIS_HR_CSV.exists(),
         "thesis_spo2_dir_exists": THESIS_SPO2_DIR.exists(),
-        "spo2_files_count": len(spo2_files),
-        "spo2_files_sample": spo2_files[:10],
-        "allowed_methods": sorted(ALLOWED_METHODS),
     }
 
 
@@ -250,7 +135,7 @@ async def upload_video(
     modality: str = Form("face"),
     method: str = Form("thesis_precomputed"),
     min_valid_pct: float = Form(50.0),
-    save: int = Form(1),
+    save: int = Form(0),
 ):
     subject_id = (subject_id or "S01").strip() or "S01"
     condition = (condition or "rest").strip().lower()
@@ -267,97 +152,47 @@ async def upload_video(
     stem = f"{subject_id}_{condition}_{modality}"
     base = str(request.base_url).rstrip("/")
 
-    out: Dict[str, Any] = {
-        "ok": 1,
-        "version": APP_VERSION,
-        "method": method,
-        "stem": stem,
-        "subject": subject_id,
-        "condition": condition,
-        "modality": modality,
-        "min_valid_pct": float(min_valid_pct),
-    }
+    # If upload-based method, we require file
+    if method in {"fft", "ceemdan_hilbert"} and file is None:
+        return JSONResponse(status_code=400, content={"ok": 0, "error": "no_file_uploaded"})
 
-    # -----------------------------
-    # METHOD 1: THESIS (precomputed)
-    # -----------------------------
-    if method == "thesis_precomputed":
-        hr = thesis_hr_lookup(stem)
-        sp = thesis_spo2_lookup(stem)
-
-        hr_bpm = hr.get("hr_bpm")
-        valid_pct = hr.get("valid_pct_masked")
-        trusted = 1 if (valid_pct is not None and valid_pct >= float(min_valid_pct)) else 0
-
-        spo2_pct = sp.get("spo2_pct")
-        spo2_trusted = 1 if (spo2_pct is not None) else 0
-
-        out.update(
-            {
-                "hr_bpm": hr_bpm,
-                "valid_pct_masked": valid_pct,
-                "trusted": trusted,
-                "hr_method": "thesis_csv",
-                "spo2_pct": spo2_pct,
-                "spo2_trusted": spo2_trusted,
-                "spo2_method": "thesis_trend_csv",
-                "details": {
-                    "selected_imf": hr.get("selected_imf"),
-                    "spo2_n": sp.get("n"),
-                    "spo2_min": sp.get("min_pct"),
-                    "spo2_max": sp.get("max_pct"),
-                    "spo2_file": sp.get("file"),
-                    "hr_error": hr.get("error"),
-                    "spo2_error": sp.get("error"),
-                },
-            }
-        )
-
-        csv_name = f"{stem}_thesis_{uuid.uuid4().hex[:8]}.csv"
-        csv_path = DOWNLOAD_DIR / csv_name
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["subject", "condition", "modality", "method", "stem", "hr_bpm", "trusted", "spo2_pct", "spo2_trusted"])
-            w.writerow([subject_id, condition, modality, method, stem, hr_bpm, trusted, spo2_pct, spo2_trusted])
-
-        out["saved"] = {"summary_metrics_csv": str(csv_path), "download_url": f"{base}/downloads/{csv_name}"}
-        return JSONResponse(content=out)
-
-    # -----------------------------
-    # METHOD 2: REAL PIPELINE (fft)
-    # -----------------------------
-    if file is None:
-        return JSONResponse(status_code=400, content={"ok": 0, "error": "no_file_uploaded_for_real_pipeline"})
-
-    suffix = _safe_suffix(file.filename or "upload.mp4")
-    safe_name = f"{stem}_{uuid.uuid4().hex[:12]}{suffix}"
-    dst_path = UPLOAD_DIR / safe_name
-
-    with dst_path.open("wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    # Save upload (if provided)
+    dst_path = None
+    if file is not None:
+        suffix = _safe_suffix(file.filename or "upload.mp4")
+        safe_name = f"{stem}_{uuid.uuid4().hex[:12]}{suffix}"
+        dst_path = UPLOAD_DIR / safe_name
+        with dst_path.open("wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
 
     run_id = uuid.uuid4().hex[:10]
     run_dir = OUTPUT_DIR / f"{stem}_run_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.time()
-    timeout_sec = 180
+    # For thesis_precomputed we can pass any path; script will ignore video
+    video_arg = str(dst_path) if dst_path is not None else str(run_dir / "dummy.mp4")
+
+    timeout_sec = 120  # Render Free: keep reasonable
 
     cmd = [
-        sys.executable, str(SCRIPT_PATH),
-        "--video", str(dst_path),
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--video", video_arg,
         "--subject", subject_id,
         "--condition", condition,
         "--modality", modality,
         "--outdir", str(run_dir),
-        "--method", "fft",
-        "--save", "1",
+        "--min_valid_pct", str(float(min_valid_pct)),
+        "--method", method,
+        "--save", "0",   # server does not depend on CSV
+        "--max_sec", "15",
     ]
 
+    t0 = time.time()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired:
@@ -377,56 +212,43 @@ async def upload_video(
         )
 
     metrics = _parse_metrics_from_stdout(proc.stdout)
-
-    if not metrics or float(metrics.get("ok", 0.0)) != 1.0:
+    if not metrics:
         return JSONResponse(
             status_code=500,
             content={
                 "ok": 0,
-                "error": "metrics_not_found_in_stdout",
-                "stdout": proc.stdout[-2500:],
-                "stderr": proc.stderr[-2500:],
+                "error": "metrics_json_missing",
+                "stdout": proc.stdout[-3000:],
+                "stderr": proc.stderr[-3000:],
             },
         )
 
-    hr_bpm = _to_float(metrics.get("hr_bpm"))
-    spo2_pct = _to_float(metrics.get("spo2_pct"))
-    spo2_ratio = _to_float(metrics.get("spo2_ratio_rg"))
-
-    trusted = 1 if hr_bpm is not None else 0
-    spo2_trusted = 1 if spo2_pct is not None else 0
-
-    out.update(
-        {
-            "hr_bpm": hr_bpm,
-            "valid_pct_masked": metrics.get("valid_pct_masked"),
-            "trusted": trusted,
-            "hr_method": "fft_peak",
-            "spo2_pct": spo2_pct,
-            "spo2_trusted": spo2_trusted,
-            "spo2_method": "rg_acdc_ratio",
-            "details": {
-                "runtime_sec": round(time.time() - t0, 2),
-                "run_dir": str(run_dir),
-                "stdout_tail": proc.stdout[-800:],
-                "spo2_ratio_rg": spo2_ratio,
-                "spo2_error": metrics.get("spo2_error"),
-                "frames": metrics.get("frames"),
-                "fs": metrics.get("fs"),
-            },
+    # Return only the values you care about (plus details)
+    out = {
+        "ok": 1,
+        "version": APP_VERSION,
+        "method": method,
+        "stem": metrics.get("stem", stem),
+        "hr_bpm": metrics.get("hr_bpm"),
+        "trusted": metrics.get("trusted", 0),
+        "valid_pct_masked": metrics.get("valid_pct_masked"),
+        "iqr_bpm": metrics.get("iqr_bpm"),
+        "selected_imf": metrics.get("selected_imf"),
+        "spo2_trend": metrics.get("spo2_trend"),
+        "spo2_ratio": metrics.get("spo2_ratio"),
+        "spo2_quality": metrics.get("spo2_quality"),
+        "runtime_sec": round(time.time() - t0, 3),
+        "details": {
+            "run_dir": str(run_dir),
+            "hr_method": metrics.get("hr_method"),
+            "spo2_method": metrics.get("spo2_method"),
+            "warning": metrics.get("warning"),
+            "spo2_error": metrics.get("spo2_error"),
         }
-    )
+    }
 
-    csv_name = f"{stem}_real_{run_id}.csv"
-    csv_path = DOWNLOAD_DIR / csv_name
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["subject", "condition", "modality", "method", "stem", "hr_bpm", "trusted", "spo2_pct", "spo2_trusted", "spo2_ratio_rg"])
-        w.writerow([subject_id, condition, modality, method, stem, hr_bpm, trusted, spo2_pct, spo2_trusted, spo2_ratio])
-
-    out["saved"] = {"summary_metrics_csv": str(csv_path), "download_url": f"{base}/downloads/{csv_name}"}
-
-    if int(save) == 0:
+    # optional: delete upload after processing
+    if dst_path is not None:
         try:
             dst_path.unlink(missing_ok=True)
         except Exception:
